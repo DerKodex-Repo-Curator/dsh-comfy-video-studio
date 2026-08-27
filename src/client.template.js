@@ -239,7 +239,7 @@ function UploadCard({ title, hint, preview, busy, disabled, onUpload }) {
   );
 }
 
-function StudioOverlay({ useSessions, remote, sessions }) {
+function StudioOverlay({ useSessions, connection, sessions }) {
   const visible = useSyncExternalStore(visibility.subscribe.bind(visibility), visibility.getSnapshot.bind(visibility));
   const sessionId = useSessions((state) => state.current);
   const [mode, setMode] = useState("t2v");
@@ -524,7 +524,7 @@ function StudioOverlay({ useSessions, remote, sessions }) {
     const originalPrompt = values.prompt.trim();
     setOptimization({ phase: "resolving-model", message: "正在确认本会话实际选中的 provider 和 model", originalPrompt });
     try {
-      const answer = await remote.sessions.models({ sessionId });
+      const answer = await connection.api.sessions.models({ sessionId });
       if (!answer.result.ok) throw new Error(answer.result.error.message);
       const current = answer.result.value.current;
       const modelLabel = `${current.provider}/${current.model}`;
@@ -921,7 +921,7 @@ function StudioOverlay({ useSessions, remote, sessions }) {
   );
 }
 
-const inject = ["slots", "remote", "sessions"];
+const inject = ["slots", "connection", "sessions"];
 
 function installStyles(ctx) {
   ctx.effect(() => {
@@ -947,5 +947,5 @@ function apply(ctx) {
     name: "shell.overlay",
     id: "comfy-video-studio",
     order: 900
-  }, (props) => h(StudioOverlay, { ...props, remote: ctx.remote, sessions: ctx.sessions })));
+  }, (props) => h(StudioOverlay, { ...props, connection: ctx.get("connection"), sessions: ctx.sessions })));
 }

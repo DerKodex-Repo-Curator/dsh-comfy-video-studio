@@ -67,7 +67,8 @@ for (const marker of [
   'id: "dsh-comfy-video-studio"',
   'sidebar.footer.action',
   'shell.overlay',
-  'remote.sessions.models',
+  'connection.api.sessions.models',
+  'const inject = ["slots", "connection", "sessions"]',
   'sessions.binding',
   'COMFY_VIDEO_PROMPT',
   '等待提示词优化',
@@ -87,6 +88,7 @@ for (const marker of [
   'className: "cvs-shell"',
   'prefers-reduced-motion'
 ]) if (!client.includes(marker)) throw new Error(`client feature missing: ${marker}`);
+if (client.includes("remote.sessions.models")) throw new Error("client must query session models through connection.api.sessions");
 if (/__[A-Z0-9_]+__/.test(client)) throw new Error("unresolved client placeholder");
 
 for (const mode of ["i2v", "t2v"]) {
