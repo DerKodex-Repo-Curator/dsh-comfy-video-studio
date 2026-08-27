@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+lib/
+dist/
+
+# Temp / logs
+.tmp/
+*.log
+*.tgz
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
