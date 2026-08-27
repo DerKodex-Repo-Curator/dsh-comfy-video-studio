@@ -1,6 +1,6 @@
 {
   "name": "dsh-comfy-video-studio",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Full-screen MiniMax H3 video studio for DeepSeek Harness backed by a local ComfyUI server",
   "keywords": [
     "deepseek-harness",
@@ -9,6 +9,14 @@
     "minimax-h3",
     "video-generation"
   ],
+  "homepage": "https://github.com/a1303845406/dsh-comfy-video-studio#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/a1303845406/dsh-comfy-video-studio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/a1303845406/dsh-comfy-video-studio/issues"
+  },
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
