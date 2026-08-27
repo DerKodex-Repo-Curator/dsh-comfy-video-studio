@@ -26,15 +26,29 @@ npm run build
 npm run check
 ```
 
-## 安装到远程 Harness
+## 从 GitHub 安装
 
-将整个插件目录或 `npm pack` 生成的 `.tgz` 复制到远程机，然后执行：
+### 安装 GitHub Release（推荐）
+
+使用 GitHub CLI 下载当前 Release 安装包：
 
 ```powershell
-dsh plugin --profile web add <插件目录或tgz路径>
+gh release download v0.6.1 --repo a1303845406/dsh-comfy-video-studio --pattern "dsh-comfy-video-studio-0.6.1.tgz"
+dsh plugin --profile web add .\dsh-comfy-video-studio-0.6.1.tgz
 ```
 
-重新启动 `dsh web`。侧栏底部会出现“视频工作台”。
+也可以从 GitHub 源码构建安装：
+
+```powershell
+git clone https://github.com/a1303845406/dsh-comfy-video-studio.git
+Set-Location .\dsh-comfy-video-studio
+npm install
+npm run build
+npm run check
+dsh plugin --profile web add .
+```
+
+重新启动 `dsh web`。侧栏底部会出现“视频工作台”。关键帧模式在 ComfyUI `v0.33.1` 上还需要安装 [`comfyui-minimax-h3-keyframe-backport`](https://github.com/a1303845406/comfyui-minimax-h3-keyframe-backport)。
 
 首次启动时会提供 `http://127.0.0.1:8188` 默认连接。远程地址不写入插件 profile：在视频工作台展开“管理 ComfyUI 连接”，填写名称和地址后即可测试、保存、更新、切换或删除，全程无需重启 Harness。
 
