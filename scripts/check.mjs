@@ -29,6 +29,10 @@ for (const file of [
 
 if (pkg.name !== "dsh-comfy-video-studio") throw new Error("package name mismatch");
 if (pkg.dsh?.bundle?.patch !== "./cordis.patch.yml") throw new Error("missing dsh bundle patch");
+if (pkg.publishConfig?.access !== "public") throw new Error("npm package must publish publicly");
+if (pkg.publishConfig?.registry !== "https://registry.npmjs.org/") throw new Error("npm package must publish to the official registry");
+if (!pkg.files?.includes("lib")) throw new Error("npm package must include prebuilt lib output");
+if (pkg.scripts?.prepack !== "npm run build && npm run check") throw new Error("prepack must build and validate the package");
 for (const dependency of [
   "@deepseek-ai/dsh-client-runtime",
   "@deepseek-ai/dsh-client-connection",

@@ -4,6 +4,14 @@
 
 DeepSeek Harness 的全屏 ComfyUI 视频工作台。插件内置文生视频、图生视频和 1–3 图任意时刻关键帧工作流，支持工作流预设、持久化制作记录、用户自定义提示词模板、当前会话模型提示词优化、参数调整、任务进度、视频播放以及任意绝对目录落盘。
 
+> 本项目是社区维护的非官方插件，与 DeepSeek 官方没有隶属关系。
+
+## 兼容性
+
+- DeepSeek Harness Web `0.1.1-rc.2` 系列。
+- Node.js `20` 或更高版本。
+- ComfyUI `0.33.1` 已验证；实际节点和模型能力以目标实例的 `/object_info` 为准。
+
 ## 工作方式
 
 - 浏览器只访问 Harness 的同源 `/comfy-video/api`，不会直接暴露 ComfyUI，也不能把任意 URL 交给 Host 代理。
@@ -26,9 +34,17 @@ npm run build
 npm run check
 ```
 
-## 从 GitHub 安装
+## 安装
 
-### 安装 GitHub Release（推荐）
+### 从 npm 安装（推荐）
+
+发布到 npm 后可直接安装预构建包，不需要授权执行依赖构建脚本：
+
+```powershell
+dsh plugin --profile web add dsh-comfy-video-studio
+```
+
+### 从 GitHub Release 安装
 
 使用 GitHub CLI 下载当前 Release 安装包：
 
@@ -37,7 +53,9 @@ gh release download v0.6.1 --repo a1303845406/dsh-comfy-video-studio --pattern "
 dsh plugin --profile web add .\dsh-comfy-video-studio-0.6.1.tgz
 ```
 
-也可以从 GitHub 源码构建安装：
+### 从 GitHub 源码构建安装
+
+源码仓库不提交构建产物，因此克隆后需要先构建：
 
 ```powershell
 git clone https://github.com/a1303845406/dsh-comfy-video-studio.git

@@ -2,6 +2,10 @@
   "name": "dsh-comfy-video-studio",
   "version": "0.6.1",
   "description": "Full-screen MiniMax H3 video studio for DeepSeek Harness backed by a local ComfyUI server",
+  "author": {
+    "name": "a1303845406",
+    "url": "https://github.com/a1303845406"
+  },
   "keywords": [
     "deepseek-harness",
     "dsh-plugin",
@@ -16,6 +20,10 @@
   },
   "bugs": {
     "url": "https://github.com/a1303845406/dsh-comfy-video-studio/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "type": "module",
   "main": "./lib/index.js",
@@ -80,6 +88,7 @@
     "build": "node scripts/build.mjs",
     "check": "node scripts/check.mjs",
     "test:integration": "node scripts/integration-test.mjs",
+    "prepack": "npm run build && npm run check",
     "pack:plugin": "npm pack --pack-destination dist"
   },
   "engines": {
