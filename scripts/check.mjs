@@ -52,8 +52,10 @@ for (const marker of [
   'path === "/workflows"',
   'path === "/workflows/refresh"',
   'path === "/connections"',
+  'path === "/connections/test"',
   'connectionPresetId',
   'createConnectionCatalog',
+  'connectionsFile',
   'createWorkflowRegistry',
   'appliedRules'
 ]) if (!host.includes(marker)) throw new Error(`host feature missing: ${marker}`);
@@ -72,6 +74,8 @@ for (const marker of [
   '关键帧',
   '工作流预设',
   'ComfyUI 连接',
+  '管理 ComfyUI 连接',
+  '保存为新连接',
   '手动输入预设 ID',
   '固定 24 FPS',
   'data-ds-dark-theme',

@@ -81,7 +81,7 @@ function normalizeBaseUrl(value) {
   return parsed.toString().replace(/\/$/, "");
 }
 
-function createConnectionCatalog(rawConfig, fallbackBaseUrl) {
+function createConnectionCatalog(rawConfig, fallbackBaseUrl, storageFile, logger) {
   const configured = rawConfig.connectionPresets;
   const source = configured === undefined ? [{
     id: DEFAULT_CONNECTION_PRESET_ID,
@@ -92,31 +92,84 @@ function createConnectionCatalog(rawConfig, fallbackBaseUrl) {
     throw new Error("connectionPresets 必须是非空数组");
   }
   const presets = new Map();
-  for (const item of source) {
+  const configuredIds = new Set();
+  const retired = new Set();
+  let writeChain = Promise.resolve();
+
+  function materialize(item, origin) {
     const id = String(item?.id ?? "").trim();
     const name = String(item?.name ?? "").trim();
     if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(id)) {
       throw new Error(`ComfyUI 连接预设 ID 无效：${id || "<empty>"}`);
     }
     if (!name || name.length > 120) throw new Error(`ComfyUI 连接预设名称无效：${id}`);
-    if (presets.has(id)) throw new Error(`ComfyUI 连接预设 ID 重复：${id}`);
     const baseUrl = normalizeBaseUrl(item?.baseUrl);
     const allowSelfSigned = item?.allowSelfSigned === true;
     if (allowSelfSigned && !baseUrl.startsWith("https:")) {
       throw new Error(`allowSelfSigned 仅适用于 HTTPS 连接：${id}`);
     }
-    presets.set(id, {
+    return {
       id,
       name,
       baseUrl,
       allowSelfSigned,
+      origin,
       dispatcher: allowSelfSigned ? new Agent({ connect: { rejectUnauthorized: false } }) : null
-    });
+    };
   }
-  const defaultId = String(rawConfig.defaultConnectionPresetId ?? source[0].id).trim();
+
+  function publicPreset({ id, name, baseUrl, allowSelfSigned, origin }) {
+    return { id, name, baseUrl, allowSelfSigned, mutable: origin === "runtime" };
+  }
+
+  for (const item of source) {
+    const preset = materialize(item, "configured");
+    if (presets.has(preset.id)) throw new Error(`ComfyUI 连接预设 ID 重复：${preset.id}`);
+    configuredIds.add(preset.id);
+    presets.set(preset.id, preset);
+  }
+  let defaultId = String(rawConfig.defaultConnectionPresetId ?? source[0].id).trim();
   if (!presets.has(defaultId)) throw new Error(`默认 ComfyUI 连接预设不存在：${defaultId}`);
+
+  function persist() {
+    const payload = {
+      version: 1,
+      defaultId,
+      presets: [...presets.values()].filter((item) => item.origin === "runtime").map(publicPreset)
+    };
+    writeChain = writeChain.catch(() => {}).then(async () => {
+      await mkdir(dirname(storageFile), { recursive: true });
+      const temporary = `${storageFile}.partial-${process.pid}`;
+      await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+      await rename(temporary, storageFile);
+    });
+    return writeChain;
+  }
+
   return {
-    defaultId,
+    get defaultId() { return defaultId; },
+    async load() {
+      let parsed;
+      try {
+        parsed = JSON.parse(await readFile(storageFile, "utf8"));
+      } catch (error) {
+        if (error?.code !== "ENOENT") logger?.warn?.(`[${PLUGIN_ID}] connection preset load failed: ${publicError(error)}`);
+        return;
+      }
+      const seen = new Set();
+      for (const item of Array.isArray(parsed?.presets) ? parsed.presets : []) {
+        try {
+          const preset = materialize(item, "runtime");
+          if (configuredIds.has(preset.id) || seen.has(preset.id)) throw new Error(`ComfyUI 连接预设 ID 重复：${preset.id}`);
+          seen.add(preset.id);
+          presets.set(preset.id, preset);
+        } catch (error) {
+          logger?.warn?.(`[${PLUGIN_ID}] ignored invalid runtime connection preset: ${publicError(error)}`);
+        }
+      }
+      const savedDefault = String(parsed?.defaultId || "").trim();
+      if (presets.has(savedDefault)) defaultId = savedDefault;
+    },
     get(id) {
       const requested = String(id || defaultId).trim();
       const preset = presets.get(requested);
@@ -126,11 +179,47 @@ function createConnectionCatalog(rawConfig, fallbackBaseUrl) {
     list() {
       return {
         defaultId,
-        presets: [...presets.values()].map(({ id, name, baseUrl, allowSelfSigned }) => ({ id, name, baseUrl, allowSelfSigned }))
+        storageFile,
+        presets: [...presets.values()].map(publicPreset)
       };
     },
+    preview(payload) {
+      return materialize({
+        id: "preview",
+        name: String(payload?.name || "待测试连接"),
+        baseUrl: payload?.baseUrl,
+        allowSelfSigned: payload?.allowSelfSigned
+      }, "preview");
+    },
+    async save(payload) {
+      const requestedId = String(payload?.id || "").trim();
+      const id = requestedId || `connection-${randomUUID()}`;
+      if (configuredIds.has(id)) throw new Error("内置或静态连接预设不能在页面修改");
+      const preset = materialize({ ...payload, id }, "runtime");
+      const previous = presets.get(id);
+      if (previous?.dispatcher) retired.add(previous.dispatcher);
+      presets.set(id, preset);
+      if (payload?.makeDefault === true) defaultId = id;
+      await persist();
+      return publicPreset(preset);
+    },
+    async remove(id) {
+      const requested = String(id || "").trim();
+      if (configuredIds.has(requested)) throw new Error("内置或静态连接预设不能删除");
+      const previous = presets.get(requested);
+      if (!previous) throw new Error("连接预设不存在");
+      presets.delete(requested);
+      if (previous.dispatcher) retired.add(previous.dispatcher);
+      if (defaultId === requested) defaultId = presets.keys().next().value;
+      await persist();
+      return { removed: 1, defaultId };
+    },
     async close() {
-      await Promise.all([...presets.values()].map((item) => item.dispatcher?.close?.()).filter(Boolean));
+      const dispatchers = new Set([
+        ...[...presets.values()].map((item) => item.dispatcher).filter(Boolean),
+        ...retired
+      ]);
+      await Promise.all([...dispatchers].map((dispatcher) => dispatcher.close()));
     }
   };
 }
@@ -141,6 +230,15 @@ function websocketUrl(baseUrl, clientId) {
   url.pathname = `${url.pathname.replace(/\/$/, "")}/ws`;
   url.search = new URLSearchParams({ clientId }).toString();
   return url.toString();
+}
+
+function publicConnection(connection) {
+  return {
+    id: connection.id,
+    name: connection.name,
+    baseUrl: connection.baseUrl,
+    allowSelfSigned: connection.allowSelfSigned === true
+  };
 }
 
 function finiteNumber(value, fallback, min, max) {
@@ -321,9 +419,10 @@ export function apply(ctx, rawConfig = {}) {
     requestTimeoutMs: rawConfig.requestTimeoutMs ?? 30000,
     historyLimit: integer(rawConfig.historyLimit, 200, 10, 2000),
     historyFile: resolve(rawConfig.historyFile || join(dshHome, "storages", PLUGIN_ID, "history.json")),
+    connectionsFile: resolve(rawConfig.connectionsFile || join(dshHome, "storages", PLUGIN_ID, "connections.json")),
     workflowDirectory: resolve(rawConfig.workflowDirectory || join(dshHome, "storages", PLUGIN_ID, "workflows"))
   };
-  const connectionCatalog = createConnectionCatalog(rawConfig, config.baseUrl);
+  const connectionCatalog = createConnectionCatalog(rawConfig, config.baseUrl, config.connectionsFile, ctx.logger);
   const workflowRegistry = createWorkflowRegistry({
     builtInManifest: builtInWorkflowManifest,
     customDirectory: config.workflowDirectory,
@@ -465,7 +564,8 @@ export function apply(ctx, rawConfig = {}) {
     }
   }
 
-  const historyReady = loadHistory();
+  const connectionReady = connectionCatalog.load();
+  const historyReady = connectionReady.then(loadHistory);
 
   async function savePromptTemplate(payload) {
     const name = String(payload?.name ?? "").trim();
@@ -830,6 +930,29 @@ export function apply(ctx, rawConfig = {}) {
     return response.json();
   }
 
+  async function inspectConnection(connection) {
+    const [stats, objectInfo] = await Promise.all([
+      comfyJson(connection, "/system_stats"),
+      comfyJson(connection, "/object_info")
+    ]);
+    const required = [
+      "SaveVideo", "LoadImage", "VAELoader", "VAEDecodeAudio",
+      "KSamplerSelect", "BasicScheduler", "SamplerCustomAdvanced", "BasicGuider",
+      "UNETLoader", "CLIPLoader", "RandomNoise", "CreateVideo",
+      "MiniMaxH3ImageToVideo", "MiniMaxH3AddImageGuideBackport", "Video Slice", "ComfyMathExpression", "PrimitiveFloat"
+    ];
+    const missingNodes = required.filter((name) => !objectInfo?.[name]);
+    return {
+      ok: missingNodes.length === 0,
+      connection: publicConnection(connection),
+      missingNodes,
+      stats,
+      historyFile: config.historyFile,
+      workflowDirectory: config.workflowDirectory,
+      workflows: workflowRegistry.list()
+    };
+  }
+
   async function serveVideo(req, res, task) {
     if (!task?.outputPath) return json(res, 404, { error: "视频尚未生成" });
     let info;
@@ -880,34 +1003,26 @@ export function apply(ctx, rawConfig = {}) {
       await workflowReady;
       if (req.method === "GET" && path === "/health") {
         const connection = connectionCatalog.get(url.searchParams.get("connectionPresetId"));
-        const [stats, objectInfo] = await Promise.all([
-          comfyJson(connection, "/system_stats"),
-          comfyJson(connection, "/object_info")
-        ]);
-        const required = [
-          "SaveVideo", "LoadImage", "VAELoader", "VAEDecodeAudio",
-          "KSamplerSelect", "BasicScheduler", "SamplerCustomAdvanced", "BasicGuider",
-          "UNETLoader", "CLIPLoader", "RandomNoise", "CreateVideo",
-          "MiniMaxH3ImageToVideo", "MiniMaxH3AddImageGuideBackport", "Video Slice", "ComfyMathExpression", "PrimitiveFloat"
-        ];
-        const missingNodes = required.filter((name) => !objectInfo?.[name]);
-        return json(res, 200, {
-          ok: missingNodes.length === 0,
-          connection: {
-            id: connection.id,
-            name: connection.name,
-            baseUrl: connection.baseUrl,
-            allowSelfSigned: connection.allowSelfSigned
-          },
-          missingNodes,
-          stats,
-          historyFile: config.historyFile,
-          workflowDirectory: config.workflowDirectory,
-          workflows: workflowRegistry.list()
-        });
+        return json(res, 200, await inspectConnection(connection));
       }
       if (req.method === "GET" && path === "/connections") {
         return json(res, 200, connectionCatalog.list());
+      }
+      if (req.method === "POST" && path === "/connections/test") {
+        const connection = connectionCatalog.preview(await readJson(req));
+        try {
+          return json(res, 200, await inspectConnection(connection));
+        } finally {
+          await connection.dispatcher?.close?.();
+        }
+      }
+      if (req.method === "POST" && path === "/connections") {
+        const preset = await connectionCatalog.save(await readJson(req));
+        return json(res, 200, { preset, catalog: connectionCatalog.list() });
+      }
+      const connectionMatch = /^\/connections\/([^/]+)$/.exec(path);
+      if (req.method === "DELETE" && connectionMatch) {
+        return json(res, 200, await connectionCatalog.remove(decodeURIComponent(connectionMatch[1])));
       }
       if (req.method === "POST" && path === "/upload") {
         const connection = connectionCatalog.get(url.searchParams.get("connectionPresetId"));

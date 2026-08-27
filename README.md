@@ -36,30 +36,23 @@ dsh plugin --profile web add <插件目录或tgz路径>
 
 重新启动 `dsh web`。侧栏底部会出现“视频工作台”。
 
-未配置连接预设时，继续兼容旧版 `baseUrl`，默认连接 `http://127.0.0.1:8188`。如需在页面动态切换多个 ComfyUI，编辑该 profile 的插件配置：
+首次启动时会提供 `http://127.0.0.1:8188` 默认连接。远程地址不写入插件 profile：在视频工作台展开“管理 ComfyUI 连接”，填写名称和地址后即可测试、保存、更新、切换或删除，全程无需重启 Harness。
+
+插件 profile 只保留运行参数和可选的数据文件位置；旧版 `baseUrl`、`connectionPresets` 仍可读取，但不再是推荐方式：
 
 ```yaml
 - id: comfy-video-studio
   name: dsh-comfy-video-studio
   config:
-    defaultConnectionPresetId: remote-local
-    connectionPresets:
-      - id: remote-local
-        name: 远程机 ComfyUI（内网）
-        baseUrl: http://127.0.0.1:8188
-      - id: remote-frp
-        name: 远程机 ComfyUI（FRP）
-        baseUrl: https://comfy.example.com:443
-        # 仅当服务确实使用自签名证书时开启；优先换成可信证书
-        allowSelfSigned: true
     maxUploadMb: 40
     requestTimeoutMs: 30000
     historyLimit: 200
     # historyFile: D:\DSHData\comfy-video-history.json
+    # connectionsFile: D:\DSHData\comfy-video-connections.json
     # workflowDirectory: D:\DSHData\comfy-video-workflows
 ```
 
-连接预设由 Host 配置管理，页面只传稳定的预设 ID。切换连接后，新任务会使用新实例；正在执行和历史恢复中的任务继续绑定创建时的实例快照。图片上传属于具体 ComfyUI 实例，因此切换连接会清空当前图片引用并要求重新上传。
+页面保存的连接预设默认写入 `$DSH_HOME/storages/dsh-comfy-video-studio/connections.json`。浏览器只传稳定的预设 ID；切换连接后，新任务使用新实例，正在执行和历史恢复中的任务继续绑定创建时的实例快照。图片上传属于具体 ComfyUI 实例，因此切换地址会清空当前图片引用并要求重新上传。自签名 HTTPS 必须由用户在页面显式启用，可信证书仍是首选。
 
 ## 工作流预设
 

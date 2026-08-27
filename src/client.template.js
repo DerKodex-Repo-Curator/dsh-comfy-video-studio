@@ -53,6 +53,7 @@ const RESOLUTIONS = Object.freeze({
   balanced: { label: "576×1024（显存均衡）", width: 576, height: 1024 },
   quality: { label: "768×1344（高清，近似 9:16）", width: 768, height: 1344 }
 });
+const EMPTY_CONNECTION_DRAFT = Object.freeze({ id: "", name: "", baseUrl: "", allowSelfSigned: false, makeDefault: false, mutable: true });
 
 function nodeText(node) {
   if (node?.kind !== "assistant" || !Array.isArray(node.blocks)) return "";
@@ -259,6 +260,7 @@ function StudioOverlay({ useSessions, remote, sessions }) {
   const [templateName, setTemplateName] = useState("");
   const [workflowCatalog, setWorkflowCatalog] = useState({ defaultId: "minimax-h3-default", presets: [], invalid: [] });
   const [connectionCatalog, setConnectionCatalog] = useState({ defaultId: "default", presets: [] });
+  const [connectionDraft, setConnectionDraft] = useState({ ...EMPTY_CONNECTION_DRAFT });
   const [toast, setToast] = useState("");
   const toastTimer = useRef(null);
   const selected = tasks.find((task) => task.id === selectedId) || tasks[0] || null;
@@ -317,12 +319,15 @@ function StudioOverlay({ useSessions, remote, sessions }) {
       ? currentId
       : next.presets.some((item) => item.id === remembered) ? remembered : next.defaultId;
     setValues((current) => ({ ...current, connectionPresetId: selectedId }));
+    const selectedPreset = next.presets.find((item) => item.id === selectedId);
+    if (selectedPreset) setConnectionDraft({ ...selectedPreset, makeDefault: next.defaultId === selectedId });
     localStorage.setItem("dsh-comfy-video-studio/connectionPresetId", selectedId);
     return selectedId;
   };
 
-  const selectConnectionPreset = (connectionPresetId) => {
+  const selectConnectionPreset = (connectionPresetId, suppliedPreset = null) => {
     if (!connectionPresetId || connectionPresetId === values.connectionPresetId) return;
+    const selectedPreset = suppliedPreset || connectionCatalog.presets.find((item) => item.id === connectionPresetId);
     const hadImages = Boolean(values.image || values.keyframes.some((item) => item.image));
     for (const url of Object.values(previewUrls.current)) URL.revokeObjectURL(url);
     previewUrls.current = {};
@@ -333,9 +338,96 @@ function StudioOverlay({ useSessions, remote, sessions }) {
       image: "",
       keyframes: current.keyframes.map((item) => ({ ...item, image: "" }))
     }));
+    if (selectedPreset) setConnectionDraft({ ...selectedPreset, makeDefault: connectionCatalog.defaultId === connectionPresetId });
     localStorage.setItem("dsh-comfy-video-studio/connectionPresetId", connectionPresetId);
     void checkHealth(connectionPresetId);
     notify(hadImages ? "已切换 ComfyUI；图片属于原实例，请重新上传" : "已切换 ComfyUI 连接");
+  };
+
+  const testConnectionDraft = async () => {
+    if (!connectionDraft.name.trim() || !connectionDraft.baseUrl.trim()) return notify("请填写连接名称和 ComfyUI 地址");
+    setBusy("connection-test");
+    try {
+      const result = await api("/connections/test", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(connectionDraft)
+      });
+      notify(result.ok ? "连接测试通过，所需节点完整" : `连接成功，但缺少 ${result.missingNodes.length} 个节点`);
+    } catch (error) {
+      notify(`连接测试失败：${error.message}`);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const saveConnectionDraft = async (updateExisting) => {
+    if (!connectionDraft.name.trim() || !connectionDraft.baseUrl.trim()) return notify("请填写连接名称和 ComfyUI 地址");
+    if (updateExisting && (!connectionDraft.id || !connectionDraft.mutable)) return notify("当前连接不能在页面修改");
+    const previousPreset = connectionCatalog.presets.find((item) => item.id === connectionDraft.id);
+    const activeTargetChanged = updateExisting
+      && connectionDraft.id === values.connectionPresetId
+      && (previousPreset?.baseUrl !== connectionDraft.baseUrl.trim() || previousPreset?.allowSelfSigned !== (connectionDraft.allowSelfSigned === true));
+    setBusy("connection-save");
+    try {
+      const result = await api("/connections", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...(updateExisting ? { id: connectionDraft.id } : {}),
+          name: connectionDraft.name.trim(),
+          baseUrl: connectionDraft.baseUrl.trim(),
+          allowSelfSigned: connectionDraft.allowSelfSigned === true,
+          makeDefault: connectionDraft.makeDefault === true
+        })
+      });
+      selectConnectionPreset(result.preset.id, result.preset);
+      setConnectionCatalog(result.catalog);
+      setConnectionDraft({ ...result.preset, makeDefault: result.catalog.defaultId === result.preset.id });
+      if (activeTargetChanged) {
+        for (const url of Object.values(previewUrls.current)) URL.revokeObjectURL(url);
+        previewUrls.current = {};
+        setImagePreviews({});
+        setValues((current) => ({
+          ...current,
+          image: "",
+          keyframes: current.keyframes.map((item) => ({ ...item, image: "" }))
+        }));
+      }
+      if (result.preset.id === values.connectionPresetId) await checkHealth(result.preset.id);
+      notify(activeTargetChanged ? "连接地址已更新；旧实例图片引用已清空" : updateExisting ? "连接预设已更新并立即生效" : "连接预设已保存并切换");
+    } catch (error) {
+      notify(error.message);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const deleteConnectionDraft = async () => {
+    if (!connectionDraft.id || !connectionDraft.mutable) return notify("内置连接不能删除");
+    if (!window.confirm(`删除连接预设“${connectionDraft.name}”？已创建任务仍保留实例快照。`)) return;
+    setBusy("connection-delete");
+    try {
+      await api(`/connections/${encodeURIComponent(connectionDraft.id)}`, { method: "DELETE" });
+      if (connectionDraft.id === values.connectionPresetId) {
+        for (const url of Object.values(previewUrls.current)) URL.revokeObjectURL(url);
+        previewUrls.current = {};
+        setImagePreviews({});
+        setValues((current) => ({
+          ...current,
+          image: "",
+          keyframes: current.keyframes.map((item) => ({ ...item, image: "" }))
+        }));
+      }
+      localStorage.removeItem("dsh-comfy-video-studio/connectionPresetId");
+      const selectedId = await refreshConnections();
+      await checkHealth(selectedId);
+      notify("连接预设已删除");
+    } catch (error) {
+      notify(error.message);
+    } finally {
+      setBusy("");
+    }
   };
 
   useEffect(() => () => {
@@ -726,7 +818,45 @@ function StudioOverlay({ useSessions, remote, sessions }) {
             disabled: Boolean(busy),
             onChange: (event) => selectConnectionPreset(event.target.value)
           }, connectionCatalog.presets.map((item) => h("option", { key: item.id, value: item.id }, `${item.name} · ${item.id}`)))),
-          h("div", { className: "cvs-resolution-help" }, health.connection?.baseUrl || "连接地址由 Harness 后端预设管理"),
+          h("div", { className: "cvs-resolution-help" }, health.connection?.baseUrl || "在下方管理连接地址"),
+          h("details", { className: "cvs-template-manager" },
+            h("summary", null, "管理 ComfyUI 连接"),
+            h(Field, { label: "连接名称" }, h(Input, {
+              value: connectionDraft.name,
+              placeholder: "例如：远程机 ComfyUI",
+              onChange: (name) => setConnectionDraft((current) => ({ ...current, name }))
+            })),
+            h(Field, { label: "ComfyUI 地址" }, h(Input, {
+              type: "url",
+              value: connectionDraft.baseUrl,
+              placeholder: "https://example.com:8188",
+              onChange: (baseUrl) => setConnectionDraft((current) => ({ ...current, baseUrl }))
+            })),
+            h("label", { className: "cvs-inline" },
+              h("input", {
+                type: "checkbox",
+                checked: connectionDraft.allowSelfSigned === true,
+                onChange: (event) => setConnectionDraft((current) => ({ ...current, allowSelfSigned: event.target.checked }))
+              }),
+              "允许自签名 HTTPS 证书"
+            ),
+            h("label", { className: "cvs-inline" },
+              h("input", {
+                type: "checkbox",
+                checked: connectionDraft.makeDefault === true,
+                onChange: (event) => setConnectionDraft((current) => ({ ...current, makeDefault: event.target.checked }))
+              }),
+              "设为默认连接"
+            ),
+            h("div", { className: "cvs-template-actions" },
+              h("button", { type: "button", className: "cvs-button", disabled: Boolean(busy), onClick: testConnectionDraft }, busy === "connection-test" ? "测试中" : "测试连接"),
+              h("button", { type: "button", className: "cvs-button", disabled: Boolean(busy), onClick: () => saveConnectionDraft(false) }, "保存为新连接"),
+              h("button", { type: "button", className: "cvs-button", disabled: Boolean(busy) || !connectionDraft.mutable || !connectionDraft.id, onClick: () => saveConnectionDraft(true) }, "更新所选"),
+              h("button", { type: "button", className: "cvs-button", disabled: Boolean(busy), onClick: () => setConnectionDraft({ ...EMPTY_CONNECTION_DRAFT }) }, "清空表单"),
+              h("button", { type: "button", className: "cvs-button cvs-button-danger", disabled: Boolean(busy) || !connectionDraft.mutable || !connectionDraft.id, onClick: deleteConnectionDraft }, "删除")
+            ),
+            h("div", { className: "cvs-resolution-help" }, "地址在插件运行期间保存并立即生效；切换实例后需要重新上传参考图。")
+          ),
           h(Field, { label: "输出目录" }, h(Input, { value: values.outputDirectory, placeholder: "例如 D:\\Videos\\MiniMax", onChange: (value) => update("outputDirectory", value) })),
           h(Field, { label: "工作流预设" }, h("div", { className: "cvs-workflow-row" },
             h("select", { className: "cvs-select", value: compatibleWorkflows.some((item) => item.id === values.workflowPresetId) ? values.workflowPresetId : "", onChange: (event) => update("workflowPresetId", event.target.value) },

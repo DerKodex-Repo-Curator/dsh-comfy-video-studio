@@ -140,14 +140,11 @@ customManifest.name = "MiniMax H3 自定义测试预设";
 await writeFile(join(customWorkflowDirectory, "minimax-h3-custom.preset.json"), `${JSON.stringify(customManifest, null, 2)}\n`);
 await rm(copiedManifestPath);
 const pluginConfig = {
-  connectionPresets: [
-    { id: "primary", name: "主 ComfyUI", baseUrl: `http://127.0.0.1:${comfyPort}` },
-    { id: "secondary", name: "备用 ComfyUI", baseUrl: `http://127.0.0.1:${comfyPort}` }
-  ],
-  defaultConnectionPresetId: "primary",
+  baseUrl: `http://127.0.0.1:${comfyPort}`,
   requestTimeoutMs: 5000,
   maxUploadMb: 5,
   historyFile: join(outputRoot, "history.json"),
+  connectionsFile: join(outputRoot, "connections.json"),
   workflowDirectory: customWorkflowDirectory
 };
 apply(ctx, pluginConfig);
@@ -160,12 +157,26 @@ const pluginBase = `http://127.0.0.1:${pluginServer.address().port}/comfy-video/
 try {
   const health = await (await fetch(`${pluginBase}/health`)).json();
   assert.equal(health.ok, true);
-  assert.equal(health.connection.id, "primary");
-  const connectionCatalog = await (await fetch(`${pluginBase}/connections`)).json();
-  assert.equal(connectionCatalog.defaultId, "primary");
-  assert.deepEqual(connectionCatalog.presets.map((item) => item.id), ["primary", "secondary"]);
-  const secondaryHealth = await (await fetch(`${pluginBase}/health?connectionPresetId=secondary`)).json();
-  assert.equal(secondaryHealth.connection.id, "secondary");
+  assert.equal(health.connection.id, "default");
+  let connectionCatalog = await (await fetch(`${pluginBase}/connections`)).json();
+  assert.equal(connectionCatalog.defaultId, "default");
+  assert.deepEqual(connectionCatalog.presets.map((item) => item.id), ["default"]);
+  const testedConnection = await (await fetch(`${pluginBase}/connections/test`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "备用 ComfyUI", baseUrl: `http://127.0.0.1:${comfyPort}` })
+  })).json();
+  assert.equal(testedConnection.ok, true);
+  const savedConnection = await (await fetch(`${pluginBase}/connections`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "备用 ComfyUI", baseUrl: `http://127.0.0.1:${comfyPort}`, makeDefault: true })
+  })).json();
+  const secondaryId = savedConnection.preset.id;
+  assert.equal(savedConnection.preset.mutable, true);
+  assert.equal(savedConnection.catalog.defaultId, secondaryId);
+  const secondaryHealth = await (await fetch(`${pluginBase}/health?connectionPresetId=${encodeURIComponent(secondaryId)}`)).json();
+  assert.equal(secondaryHealth.connection.id, secondaryId);
   const workflowCatalog = await (await fetch(`${pluginBase}/workflows`)).json();
   assert.equal(workflowCatalog.defaultId, "minimax-h3-default");
   assert.equal(workflowCatalog.presets.length, 2);
@@ -177,7 +188,7 @@ try {
   const refreshed = await (await fetch(`${pluginBase}/workflows/refresh`, { method: "POST" })).json();
   assert.equal(refreshed.invalid.length, 0);
 
-  const upload = await (await fetch(`${pluginBase}/upload?connectionPresetId=secondary`, {
+  const upload = await (await fetch(`${pluginBase}/upload?connectionPresetId=${encodeURIComponent(secondaryId)}`, {
     method: "POST",
     headers: { "content-type": "image/png", "x-file-name": encodeURIComponent("reference.png") },
     body: Buffer.from("png")
@@ -229,7 +240,7 @@ try {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       mode: "i2v",
-      connectionPresetId: "secondary",
+      connectionPresetId: secondaryId,
       workflowPresetId: "minimax-h3-custom",
       values: {
         prompt: "参考图中的猫在雪地奔跑",
@@ -245,7 +256,7 @@ try {
   });
   assert.equal(createdResponse.status, 202);
   const created = await createdResponse.json();
-  assert.equal(created.connectionPresetId, "secondary");
+  assert.equal(created.connectionPresetId, secondaryId);
   assert.equal(created.connectionName, "备用 ComfyUI");
   assert.equal(created.workflowPresetId, "minimax-h3-custom");
   assert.equal(lastPrompt.prompt["114"].inputs.image, "reference.png");
@@ -374,15 +385,16 @@ try {
   }
 
   await disposeAll();
-  apply(ctx, {
-    ...pluginConfig,
-    connectionPresets: [pluginConfig.connectionPresets[0]],
-    defaultConnectionPresetId: "primary"
-  });
+  apply(ctx, pluginConfig);
   const restored = await (await fetch(`${pluginBase}/tasks`)).json();
   assert.equal(restored.length, 5);
   assert.equal(restored[0].status, "completed");
-  assert.equal(restored.some((task) => task.connectionPresetId === "secondary"), true);
+  assert.equal(restored.some((task) => task.connectionPresetId === secondaryId), true);
+  connectionCatalog = await (await fetch(`${pluginBase}/connections`)).json();
+  assert.equal(connectionCatalog.presets.length, 2);
+  assert.equal(connectionCatalog.defaultId, secondaryId);
+  const deletedConnection = await (await fetch(`${pluginBase}/connections/${encodeURIComponent(secondaryId)}`, { method: "DELETE" })).json();
+  assert.equal(deletedConnection.removed, 1);
   assert.equal((await (await fetch(`${pluginBase}/connections`)).json()).presets.length, 1);
   assert.equal((await (await fetch(`${pluginBase}/templates`)).json())[0].name, "我的关键帧运镜");
 
@@ -392,7 +404,7 @@ try {
   const removedTemplate = await (await fetch(`${pluginBase}/templates/${customTemplate.id}`, { method: "DELETE" })).json();
   assert.equal(removedTemplate.removed, 1);
   assert.deepEqual(await (await fetch(`${pluginBase}/templates`)).json(), []);
-  console.log("integration test passed: connection preset switching, keyframe workflow mapping, custom template CRUD/persistence, history reload/clear, optimization, progress, absolute output, range playback");
+  console.log("integration test passed: runtime connection CRUD/test/persistence, keyframe workflow mapping, custom template CRUD/persistence, history reload/clear, optimization, progress, absolute output, range playback");
 } finally {
   await disposeAll();
   await new Promise((resolveClose) => pluginServer.close(resolveClose));
