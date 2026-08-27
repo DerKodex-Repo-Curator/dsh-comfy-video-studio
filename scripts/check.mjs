@@ -23,7 +23,8 @@ for (const file of [
   "lib/index.js",
   "lib/workflow-presets.js",
   "lib/client.js",
-  "README.md"
+  "README.md",
+  "README.en.md"
 ]) await access(join(root, file));
 
 if (pkg.name !== "dsh-comfy-video-studio") throw new Error("package name mismatch");

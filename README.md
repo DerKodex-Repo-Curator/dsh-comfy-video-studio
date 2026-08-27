@@ -6,8 +6,8 @@ DeepSeek Harness 的全屏 ComfyUI 视频工作台。插件内置文生视频、
 
 ## 工作方式
 
-- 浏览器只访问 Harness 的同源 `/comfy-video/api`，不会直接暴露 ComfyUI。
-- Host 连接同机的 ComfyUI REST 与 WebSocket；WebSocket 失效时用 History 轮询兜底。
+- 浏览器只访问 Harness 的同源 `/comfy-video/api`，不会直接暴露 ComfyUI，也不能把任意 URL 交给 Host 代理。
+- Host 按页面选择的连接预设访问对应 ComfyUI REST 与 WebSocket；WebSocket 失效时用该实例的 History 轮询兜底。
 - “AI 优化”读取当前 Harness 会话选择的 provider/model，先判断是否存在会影响成片的歧义。信息充分时直接覆盖提示词；信息不足时自动返回当前对话提问，确认后自动回到工作台覆盖提示词。
 - 优化过程显示当前阶段、所用模型、澄清问题和优化前后字数；优化完成前“生成视频”保持禁用。
 - 提示词右上角的“展开查看”会打开大尺寸可编辑窗口，便于检查长提示词。
@@ -36,13 +36,22 @@ dsh plugin --profile web add <插件目录或tgz路径>
 
 重新启动 `dsh web`。侧栏底部会出现“视频工作台”。
 
-默认连接 `http://127.0.0.1:8188`。如 ComfyUI 使用其他端口，编辑该 profile 的插件配置：
+未配置连接预设时，继续兼容旧版 `baseUrl`，默认连接 `http://127.0.0.1:8188`。如需在页面动态切换多个 ComfyUI，编辑该 profile 的插件配置：
 
 ```yaml
 - id: comfy-video-studio
   name: dsh-comfy-video-studio
   config:
-    baseUrl: http://127.0.0.1:8188
+    defaultConnectionPresetId: remote-local
+    connectionPresets:
+      - id: remote-local
+        name: 远程机 ComfyUI（内网）
+        baseUrl: http://127.0.0.1:8188
+      - id: remote-frp
+        name: 远程机 ComfyUI（FRP）
+        baseUrl: https://comfy.example.com:443
+        # 仅当服务确实使用自签名证书时开启；优先换成可信证书
+        allowSelfSigned: true
     maxUploadMb: 40
     requestTimeoutMs: 30000
     historyLimit: 200
@@ -50,12 +59,15 @@ dsh plugin --profile web add <插件目录或tgz路径>
     # workflowDirectory: D:\DSHData\comfy-video-workflows
 ```
 
+连接预设由 Host 配置管理，页面只传稳定的预设 ID。切换连接后，新任务会使用新实例；正在执行和历史恢复中的任务继续绑定创建时的实例快照。图片上传属于具体 ComfyUI 实例，因此切换连接会清空当前图片引用并要求重新上传。
+
 ## 工作流预设
 
 - 内置预设 ID 为 `minimax-h3-default`，覆盖文生、图生和 1/2/3 关键帧五个 API 工作流。
+- 五份 API JSON 随插件保存在 `assets/workflows`。生成时 Host 直接将对应 JSON 注入参数后提交给所选 ComfyUI 的 `/prompt`，无需先导入画布工作流。
 - 页面既可以下拉选择预设，也可以手动输入同一个稳定预设 ID；ComfyUI 返回的 `prompt_id` 只是单次任务 ID，不是工作流绑定 ID。
 - 自定义目录中的 `*.preset.json` 会在页面刷新预设时重新扫描，无需重启 Harness。预设必须声明 API JSON、画布 JSON 和语义节点绑定；缺文件、重复 ID 或失效绑定会被拒绝。
-- `assets/workflows` 同时提供五份 API JSON 和五份可拖入 ComfyUI 的 `.workflow.json`。画布版关键帧图片是占位符，导入后必须重新选择。
+- `assets/workflows` 同时提供五份 API JSON 和五份可拖入 ComfyUI 的 `.workflow.json`；画布版仅用于人工查看和调试。画布版关键帧图片是占位符，导入后必须重新选择。
 
 ## ComfyUI 启动要求
 
