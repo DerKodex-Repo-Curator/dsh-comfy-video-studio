@@ -1,19 +1,51 @@
 # dsh-comfy-video-studio
 
-[中文](./README.md) | English
+A dynamic ComfyUI video-workflow studio for DeepSeek Harness. Instead of shipping model-specific templates, it imports a **ComfyUI API JSON** file and turns it into a persistent, editable workflow page.
 
-A full-screen ComfyUI MiniMax H3 video studio for DeepSeek Harness. Version 0.6 lets users create, test, edit, select, and delete persistent ComfyUI connection presets directly in the running UI without editing the plugin profile or restarting Harness. It keeps task-level connection snapshots, optional explicit self-signed TLS support, and direct submission of bundled API workflow JSON to the selected instance. It also provides text-to-video, image-to-video, and one-to-three arbitrary-time keyframe workflows; persistent generation history; prompt optimization; image upload; live progress; Range-enabled playback; and absolute-directory delivery on the Harness host.
+## Features
 
-This is an unofficial community plugin. It supports DeepSeek Harness Web `0.1.1-rc.2`, Node.js 20 or newer, and has been validated with ComfyUI `0.33.1`.
+- Parse scalar inputs, image/video uploads, enums, model selectors, and every `SaveVideo` output.
+- Validate missing nodes, models, enum values, output indices, and typed connections against the selected server's `/object_info`.
+- Persist, rename, edit, and delete workflow pages.
+- Manage multiple ComfyUI servers with health, latency, device, VRAM, and remote-queue status.
+- Use an independent FIFO scheduler per server with 1–3 active submission slots.
+- Persist queued tasks and reconnect monitoring for tasks that already have a `prompt_id`.
+- Save every video output while selecting one node as the primary preview.
 
-## Install
+Standard single-GPU ComfyUI installations may still execute prompts serially. A slot count above one controls how many prompts the plugin submits; it does not guarantee parallel GPU inference.
 
-Install the prebuilt npm package:
+## Accepted workflow format
 
-```powershell
-dsh plugin --profile web add dsh-comfy-video-studio
+Only API-format JSON is accepted: top-level keys are node IDs and every node contains `class_type` and `inputs`. Canvas JSON is rejected with an explicit re-export message.
+
+Missing dependencies block execution but do not block saving. The plugin never installs nodes/models and does not query an online package registry.
+
+## Configuration
+
+```yaml
+- insert:
+    - id: comfy-video-studio
+      name: dsh-comfy-video-studio
+      config:
+        baseUrl: http://127.0.0.1:8188
+        maxUploadMb: 100
+        maxWorkflowMb: 5
+        requestTimeoutMs: 30000
+        historyLimit: 200
 ```
 
-The Chinese README also documents installation from a GitHub Release or a source checkout.
+Runtime data is stored below `$DSH_HOME/storages/dsh-comfy-video-studio/` in `connections.json`, `history.json`, and one directory per imported workflow.
 
-See [README.md](./README.md) for the Chinese documentation with installation, configuration, and operational details.
+## Development
+
+```bash
+npm install
+npm test
+npm run build
+npm run check
+npm run test:integration
+```
+
+## License
+
+MIT

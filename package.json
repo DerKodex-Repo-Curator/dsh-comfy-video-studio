@@ -1,7 +1,7 @@
 {
   "name": "dsh-comfy-video-studio",
-  "version": "0.6.1",
-  "description": "Full-screen MiniMax H3 video studio for DeepSeek Harness backed by a local ComfyUI server",
+  "version": "0.8.0",
+  "description": "Dynamic API-workflow video studio for DeepSeek Harness with ComfyUI compatibility checks and per-server queues",
   "author": {
     "name": "a1303845406",
     "url": "https://github.com/a1303845406"
@@ -10,7 +10,7 @@
     "deepseek-harness",
     "dsh-plugin",
     "comfyui",
-    "minimax-h3",
+    "dynamic-workflows",
     "video-generation"
   ],
   "homepage": "https://github.com/a1303845406/dsh-comfy-video-studio#readme",
@@ -34,7 +34,6 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "assets/workflows",
     "lib",
     "cordis.patch.yml",
     "README.md",
@@ -84,9 +83,9 @@
     }
   },
   "scripts": {
-    "generate:workflows": "node scripts/generate-workflows.mjs",
     "build": "node scripts/build.mjs",
     "check": "node scripts/check.mjs",
+    "test": "node --test tests/*.test.mjs",
     "test:integration": "node scripts/integration-test.mjs",
     "prepack": "npm run build && npm run check",
     "pack:plugin": "npm pack --pack-destination dist"

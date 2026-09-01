@@ -1,266 +1,385 @@
-import { access, readFile, readdir } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 
-export const DEFAULT_WORKFLOW_PRESET_ID = "minimax-h3-default";
-export const GENERATION_FPS = 24;
-export const RESOLUTION_PRESETS = Object.freeze({
-  balanced: Object.freeze({ id: "balanced", label: "576×1024（显存均衡）", width: 576, height: 1024 }),
-  quality: Object.freeze({ id: "quality", label: "768×1344（高清，近似 9:16）", width: 768, height: 1344 })
+export const WORKFLOW_SCHEMA_VERSION = 1;
+
+const TRUSTED_NODE_HINTS = Object.freeze({
+  LangGeReferenceVideoPlan: Object.freeze({ package: "ComfyUI-LangGe-DynamicVideo", source: "郎哥项目随附自定义节点" }),
+  LangGeWanAnimate2Dynamic: Object.freeze({ package: "ComfyUI-LangGe-DynamicVideo", source: "郎哥项目随附自定义节点" }),
+  LatentSyncNode: Object.freeze({ package: "ComfyUI-LatentSyncWrapper", source: "ComfyUI-LatentSyncWrapper" })
 });
-
-const MODE_REQUIRED_BINDINGS = Object.freeze({
-  t2v: ["prompt", "width", "height", "duration", "fps", "bitDepth", "steps", "denoise", "scheduler", "sampler", "seed", "unetName", "weightDtype", "clipName", "clipDevice", "videoVae", "audioVae", "sliceDuration", "sliceStrict", "format", "codec", "prefix"],
-  i2v: ["prompt", "width", "height", "duration", "fps", "bitDepth", "steps", "denoise", "scheduler", "sampler", "seed", "unetName", "weightDtype", "clipName", "clipDevice", "videoVae", "audioVae", "sliceDuration", "sliceStrict", "format", "codec", "prefix", "image"],
-  keyframe: ["prompt", "width", "height", "length", "fps", "bitDepth", "steps", "denoise", "scheduler", "sampler", "seed", "unetName", "weightDtype", "clipName", "clipDevice", "videoVae", "audioVae", "sliceDuration", "sliceStrict", "format", "codec", "prefix", "images", "guides"]
-});
-
-function finiteNumber(value, fallback, min, max) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return fallback;
-  return Math.min(max, Math.max(min, number));
-}
-
-function integer(value, fallback, min, max) {
-  return Math.round(finiteNumber(value, fallback, min, max));
-}
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function containedPath(base, candidate) {
-  const absoluteBase = resolve(base);
-  const absoluteCandidate = resolve(base, candidate);
-  const rel = relative(absoluteBase, absoluteCandidate);
-  if (rel === "" || (!rel.startsWith("..") && !rel.includes(":") && !rel.startsWith("/"))) return absoluteCandidate;
-  throw new Error(`工作流路径越出预设目录：${candidate}`);
+function plainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function bindingList(binding) {
-  if (Array.isArray(binding)) return binding.flatMap(bindingList);
-  return binding && typeof binding === "object" && typeof binding.node === "string" && typeof binding.input === "string" ? [binding] : [];
+export function isConnection(value, workflow = null) {
+  return Array.isArray(value)
+    && value.length === 2
+    && (typeof value[0] === "string" || Number.isInteger(value[0]))
+    && Number.isInteger(value[1])
+    && (!workflow || Object.hasOwn(workflow, String(value[0])));
 }
 
-function validateBinding(workflow, binding, label) {
-  const items = bindingList(binding);
-  if (items.length === 0) throw new Error(`缺少有效语义绑定：${label}`);
-  for (const item of items) {
-    const node = workflow[item.node];
-    if (!node || typeof node !== "object") throw new Error(`${label} 指向不存在的节点 ${item.node}`);
-    if (!node.inputs || !Object.hasOwn(node.inputs, item.input)) throw new Error(`${label} 指向不存在的输入 ${item.node}.${item.input}`);
-  }
-}
-
-async function loadModeEntry(base, mode, raw, label, expectedKeyframes = null) {
-  if (!raw || typeof raw !== "object") throw new Error(`${label} 配置无效`);
-  const apiPath = containedPath(base, String(raw.api || ""));
-  const canvasPath = containedPath(base, String(raw.canvas || ""));
-  const workflow = JSON.parse(await readFile(apiPath, "utf8"));
-  await access(canvasPath);
-  if (!workflow || Array.isArray(workflow) || typeof workflow !== "object") throw new Error(`${label} API JSON 格式无效`);
-  const required = MODE_REQUIRED_BINDINGS[mode];
-  for (const key of required) validateBinding(workflow, raw.bindings?.[key], `${label}.${key}`);
-  if (expectedKeyframes != null) {
-    if (raw.bindings.images.length !== expectedKeyframes || raw.bindings.guides.length !== expectedKeyframes) {
-      throw new Error(`${label} 必须提供 ${expectedKeyframes} 组图片和时间绑定`);
+export function parseApiWorkflow(input) {
+  let value = input;
+  if (Buffer.isBuffer(value)) value = value.toString("utf8");
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value.replace(/^\uFEFF/, ""));
+    } catch {
+      throw new Error("工作流文件不是有效 JSON");
     }
   }
-  return { apiPath, canvasPath, workflow, bindings: clone(raw.bindings) };
+  if (!plainObject(value)) throw new Error("工作流必须是以节点 ID 为顶层键的 API JSON 对象");
+  if (Array.isArray(value.nodes) || plainObject(value.extra) || plainObject(value.state)) {
+    throw new Error("检测到 ComfyUI 画布 JSON；请使用“导出（API 格式）”重新导出后上传");
+  }
+  const entries = Object.entries(value);
+  if (entries.length === 0) throw new Error("工作流不包含任何节点");
+  for (const [nodeId, node] of entries) {
+    if (!plainObject(node) || typeof node.class_type !== "string" || !plainObject(node.inputs)) {
+      throw new Error(`节点 ${nodeId} 缺少 class_type 或 inputs；只支持 API JSON`);
+    }
+  }
+  return clone(value);
 }
 
-async function loadPresetManifest(filename, source) {
-  const base = dirname(filename);
-  const raw = JSON.parse(await readFile(filename, "utf8"));
-  const id = String(raw.id || "").trim();
-  if (!/^[a-z0-9][a-z0-9._-]{2,63}$/i.test(id)) throw new Error("预设 ID 只能包含字母、数字、点、下划线和连字符，长度 3-64");
-  const name = String(raw.name || "").trim();
-  if (!name) throw new Error("预设名称不能为空");
-  if (Number(raw.schemaVersion) !== 1) throw new Error(`不支持的预设 schemaVersion：${raw.schemaVersion}`);
-  const modes = {};
-  if (raw.modes?.t2v) modes.t2v = await loadModeEntry(base, "t2v", raw.modes.t2v, `${id}.t2v`);
-  if (raw.modes?.i2v) modes.i2v = await loadModeEntry(base, "i2v", raw.modes.i2v, `${id}.i2v`);
-  if (raw.modes?.keyframe) {
-    const variants = {};
-    for (const count of [1, 2, 3]) {
-      const entry = raw.modes.keyframe.variants?.[count];
-      if (!entry) throw new Error(`${id}.keyframe 缺少 ${count} 帧变体`);
-      variants[count] = await loadModeEntry(base, "keyframe", entry, `${id}.keyframe.${count}`, count);
-    }
-    modes.keyframe = { variants };
-  }
-  if (Object.keys(modes).length === 0) throw new Error("预设没有可用模式");
+export function workflowHash(workflow) {
+  return createHash("sha256").update(JSON.stringify(workflow)).digest("hex");
+}
+
+function descriptorFor(schema, inputName) {
+  return schema?.input?.required?.[inputName] ?? schema?.input?.optional?.[inputName] ?? null;
+}
+
+function descriptorType(descriptor) {
+  if (!Array.isArray(descriptor)) return null;
+  return typeof descriptor[0] === "string" ? descriptor[0] : Array.isArray(descriptor[0]) ? "COMBO" : null;
+}
+
+function descriptorMeta(descriptor) {
+  return plainObject(descriptor?.[1]) ? descriptor[1] : {};
+}
+
+function descriptorOptions(descriptor) {
+  if (Array.isArray(descriptor?.[0])) return descriptor[0];
+  if (descriptor?.[0] === "COMBO" && Array.isArray(descriptor?.[1]?.options)) return descriptor[1].options;
+  return null;
+}
+
+function isHiddenInput(schema, inputName) {
+  return Boolean(schema?.input?.hidden && Object.hasOwn(schema.input.hidden, inputName));
+}
+
+function inferFieldKind({ node, inputName, value, descriptor }) {
+  const meta = descriptorMeta(descriptor);
+  if (meta.image_upload || node.class_type === "LoadImage" && inputName === "image") return "image";
+  if (meta.video_upload || node.class_type === "LoadVideo" && ["file", "video"].includes(inputName)) return "video";
+  const options = descriptorOptions(descriptor);
+  if (options) return "enum";
+  const runtimeType = descriptorType(descriptor);
+  if (runtimeType === "BOOLEAN" || typeof value === "boolean") return "boolean";
+  if (runtimeType === "INT" || Number.isInteger(value)) return "integer";
+  if (runtimeType === "FLOAT" || typeof value === "number") return "number";
+  if (runtimeType === "STRING" || typeof value === "string") return meta.multiline ? "textarea" : "text";
+  if (value === null) return "text";
+  return "json";
+}
+
+function isModelField(schema, inputName) {
+  const category = String(schema?.category || "").toLowerCase();
+  if (category.includes("model/loaders")) return true;
+  return /^(ckpt_name|unet_name|model_name|vae_name|clip_name|lora_name|control_net_name)$/i.test(inputName);
+}
+
+function suggestedVisible(kind, inputName, meta) {
+  if (["image", "video", "boolean"].includes(kind)) return true;
+  if (meta.multiline) return true;
+  return /(prompt|text|value|switch|voice|speed|duration|seconds)$/i.test(inputName);
+}
+
+function normalizeField(field, fallback, index) {
+  const source = plainObject(field) ? field : {};
   return {
-    id,
-    name: name.slice(0, 120),
-    description: String(raw.description || "").trim().slice(0, 500),
-    source,
-    manifestPath: filename,
-    modes
+    ...fallback,
+    visible: source.visible === undefined ? fallback.visible : source.visible === true,
+    label: String(source.label || fallback.label).trim().slice(0, 160),
+    group: String(source.group || fallback.group).trim().slice(0, 160),
+    advanced: source.advanced === undefined ? fallback.advanced : source.advanced === true,
+    order: Number.isFinite(Number(source.order)) ? Math.max(0, Math.round(Number(source.order))) : index
   };
 }
 
-function publicPreset(preset) {
-  return {
-    id: preset.id,
-    name: preset.name,
-    description: preset.description,
-    source: preset.source,
-    modes: Object.keys(preset.modes)
-  };
-}
+export function analyzeWorkflow(workflowInput, objectInfo = null, configuredFields = null) {
+  const workflow = parseApiWorkflow(workflowInput);
+  const structuralErrors = [];
+  const connectionErrors = [];
+  const invalidOptions = [];
+  const missingModels = [];
+  const missingNodes = [];
+  const fields = [];
+  const outputs = [];
+  const configured = new Map((Array.isArray(configuredFields) ? configuredFields : []).map((field) => [field.id, field]));
+  let order = 0;
 
-export function createWorkflowRegistry({ builtInManifest, customDirectory, logger }) {
-  let presets = new Map();
-  let invalid = [];
-
-  async function refresh() {
-    const next = new Map();
-    const errors = [];
-    const manifests = [{ filename: resolve(builtInManifest), source: "built-in" }];
-    if (customDirectory) {
-      try {
-        const entries = await readdir(resolve(customDirectory), { withFileTypes: true });
-        for (const entry of entries) {
-          if (entry.isFile() && entry.name.endsWith(".preset.json")) manifests.push({ filename: resolve(customDirectory, entry.name), source: "custom" });
+  for (const [nodeId, node] of Object.entries(workflow)) {
+    const schema = objectInfo?.[node.class_type] ?? null;
+    if (objectInfo && !schema && !missingNodes.includes(node.class_type)) missingNodes.push(node.class_type);
+    if (node.class_type === "SaveVideo") {
+      outputs.push({ nodeId, classType: node.class_type, title: String(node._meta?.title || `SaveVideo ${nodeId}`) });
+    }
+    for (const [inputName, value] of Object.entries(node.inputs)) {
+      if (Array.isArray(value) && value.length === 2 && Number.isInteger(value[1])) {
+        const sourceId = String(value[0]);
+        if (!Object.hasOwn(workflow, sourceId)) {
+          structuralErrors.push({ nodeId, inputName, message: `连接引用了不存在的源节点 ${sourceId}` });
+          continue;
         }
-      } catch (error) {
-        if (error?.code !== "ENOENT") errors.push({ file: resolve(customDirectory), error: error.message });
+        if (objectInfo && schema && objectInfo[workflow[sourceId].class_type]) {
+          const sourceSchema = objectInfo[workflow[sourceId].class_type];
+          const sourceType = sourceSchema.output?.[value[1]];
+          const targetDescriptor = descriptorFor(schema, inputName);
+          const targetType = descriptorType(targetDescriptor);
+          if (sourceType === undefined) {
+            connectionErrors.push({ nodeId, inputName, sourceId, outputIndex: value[1], message: `源节点 ${sourceId} 没有第 ${value[1]} 个输出` });
+          } else if (targetType && sourceType && targetType !== sourceType && !["*", "ANY"].includes(targetType)) {
+            connectionErrors.push({ nodeId, inputName, sourceId, outputIndex: value[1], sourceType, targetType, message: `${sourceType} 不能连接到 ${targetType}` });
+          }
+        }
+        continue;
       }
+      if (!["string", "number", "boolean"].includes(typeof value) && value !== null) continue;
+      if (schema && isHiddenInput(schema, inputName)) continue;
+      const descriptor = descriptorFor(schema, inputName);
+      const meta = descriptorMeta(descriptor);
+      const options = descriptorOptions(descriptor);
+      let kind = inferFieldKind({ node, inputName, value, descriptor });
+      const model = isModelField(schema, inputName);
+      if (model) kind = "model";
+      if (objectInfo && schema && options && typeof value === "string" && !options.includes(value)) {
+        const finding = { nodeId, classType: node.class_type, inputName, value, available: options.slice(0, 200) };
+        if (model) missingModels.push(finding);
+        else if (!["image", "video"].includes(kind)) invalidOptions.push(finding);
+      }
+      const title = String(node._meta?.title || schema?.display_name || node.class_type);
+      const visible = suggestedVisible(kind, inputName, meta);
+      const fallback = {
+        id: `${nodeId}.${inputName}`,
+        nodeId,
+        classType: node.class_type,
+        inputName,
+        label: `${title} · ${inputName}`,
+        group: title,
+        kind,
+        defaultValue: clone(value),
+        required: Boolean(schema?.input?.required && Object.hasOwn(schema.input.required, inputName)),
+        visible,
+        advanced: !visible,
+        order,
+        options: options ? clone(options) : [],
+        min: Number.isFinite(Number(meta.min)) ? Number(meta.min) : null,
+        max: Number.isFinite(Number(meta.max)) ? Number(meta.max) : null,
+        step: Number.isFinite(Number(meta.step)) ? Number(meta.step) : null,
+        multiline: meta.multiline === true,
+        model
+      };
+      fields.push(normalizeField(configured.get(fallback.id), fallback, order));
+      order += 1;
     }
-    for (const item of manifests) {
+  }
+
+  if (outputs.length === 0) structuralErrors.push({ message: "没有找到 SaveVideo 输出节点；第一版只支持视频工作流" });
+  const nodeHints = missingNodes.map((classType) => ({ classType, hint: TRUSTED_NODE_HINTS[classType] ?? null }));
+  const ok = Boolean(objectInfo)
+    && structuralErrors.length === 0
+    && missingNodes.length === 0
+    && missingModels.length === 0
+    && invalidOptions.length === 0
+    && connectionErrors.length === 0;
+  return {
+    ok,
+    status: objectInfo ? (ok ? "compatible" : "incompatible") : "unverified",
+    nodeCount: Object.keys(workflow).length,
+    hash: workflowHash(workflow),
+    fields,
+    outputs,
+    suggestedPrimaryOutputNodeId: outputs.at(-1)?.nodeId ?? null,
+    structuralErrors,
+    missingNodes,
+    missingModels,
+    invalidOptions,
+    connectionErrors,
+    nodeHints
+  };
+}
+
+function coerceFieldValue(field, value) {
+  if (value === undefined) return clone(field.defaultValue);
+  if (field.kind === "boolean") return value === true || value === "true";
+  if (field.kind === "integer") {
+    const number = Math.round(Number(value));
+    if (!Number.isFinite(number)) throw new Error(`${field.label} 必须是整数`);
+    if (field.min != null && number < field.min) throw new Error(`${field.label} 不能小于 ${field.min}`);
+    if (field.max != null && number > field.max) throw new Error(`${field.label} 不能大于 ${field.max}`);
+    return number;
+  }
+  if (field.kind === "number") {
+    const number = Number(value);
+    if (!Number.isFinite(number)) throw new Error(`${field.label} 必须是数字`);
+    if (field.min != null && number < field.min) throw new Error(`${field.label} 不能小于 ${field.min}`);
+    if (field.max != null && number > field.max) throw new Error(`${field.label} 不能大于 ${field.max}`);
+    return number;
+  }
+  if (["enum", "model"].includes(field.kind) && field.options.length > 0 && !field.options.includes(value)) {
+    throw new Error(`${field.label} 的值不在当前服务器可选项中`);
+  }
+  if (field.kind === "json") {
+    if (plainObject(value) || Array.isArray(value)) return clone(value);
+    try { return JSON.parse(String(value)); } catch { throw new Error(`${field.label} 不是有效 JSON`); }
+  }
+  return String(value ?? "");
+}
+
+export function applyWorkflowValues(workflowInput, fields, values = {}) {
+  const workflow = parseApiWorkflow(workflowInput);
+  for (const field of Array.isArray(fields) ? fields : []) {
+    const node = workflow[field.nodeId];
+    if (!node?.inputs || !Object.hasOwn(node.inputs, field.inputName)) throw new Error(`参数绑定失效：${field.id}`);
+    node.inputs[field.inputName] = coerceFieldValue(field, values[field.id]);
+  }
+  return workflow;
+}
+
+function safeDirectory(base, id) {
+  const root = resolve(base);
+  const target = resolve(root, id);
+  const rel = relative(root, target);
+  if (!rel || rel.startsWith("..") || rel.includes(":")) throw new Error("工作流 ID 越出存储目录");
+  return target;
+}
+
+async function atomicWrite(filename, value) {
+  await mkdir(dirname(filename), { recursive: true });
+  const temporary = `${filename}.partial-${process.pid}-${randomUUID()}`;
+  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await rename(temporary, filename);
+}
+
+function publicWorkflow(record, includeWorkflow = false) {
+  return { ...clone(record.definition), ...(includeWorkflow ? { workflow: clone(record.workflow) } : {}) };
+}
+
+export function createWorkflowRegistry({ directory, logger }) {
+  const root = resolve(directory);
+  const records = new Map();
+
+  async function load() {
+    records.clear();
+    let entries = [];
+    try { entries = await readdir(root, { withFileTypes: true }); }
+    catch (error) { if (error?.code !== "ENOENT") throw error; }
+    for (const entry of entries.filter((item) => item.isDirectory())) {
       try {
-        const preset = await loadPresetManifest(item.filename, item.source);
-        if (next.has(preset.id)) throw new Error(`预设 ID 重复：${preset.id}`);
-        next.set(preset.id, preset);
+        const folder = safeDirectory(root, entry.name);
+        const definition = JSON.parse(await readFile(resolve(folder, "definition.json"), "utf8"));
+        const workflow = parseApiWorkflow(await readFile(resolve(folder, "workflow.json")));
+        if (definition.schemaVersion !== WORKFLOW_SCHEMA_VERSION || definition.id !== entry.name) throw new Error("定义版本或 ID 无效");
+        const analysis = analyzeWorkflow(workflow, null, definition.fields);
+        definition.fields = analysis.fields;
+        definition.outputs = analysis.outputs;
+        definition.hash = workflowHash(workflow);
+        records.set(entry.name, { definition, workflow });
       } catch (error) {
-        errors.push({ file: item.filename, error: error.message });
+        logger?.warn?.(`[dsh-comfy-video-studio] ignored workflow ${entry.name}: ${error.message}`);
       }
     }
-    if (!next.has(DEFAULT_WORKFLOW_PRESET_ID)) throw new Error(`内置工作流预设加载失败：${errors.map((item) => item.error).join("；")}`);
-    presets = next;
-    invalid = errors;
-    for (const item of errors) logger?.warn?.(`[dsh-comfy-video-studio] workflow preset rejected: ${item.file}: ${item.error}`);
     return list();
   }
 
   function list() {
-    return {
-      defaultId: DEFAULT_WORKFLOW_PRESET_ID,
-      presets: [...presets.values()].map(publicPreset).sort((a, b) => a.name.localeCompare(b.name)),
-      invalid: clone(invalid)
+    return [...records.values()].map((record) => publicWorkflow(record)).sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  function get(id) {
+    const record = records.get(String(id || ""));
+    if (!record) throw new Error("工作流不存在");
+    return publicWorkflow(record, true);
+  }
+
+  async function save(payload) {
+    const workflow = parseApiWorkflow(payload?.workflow);
+    const baseAnalysis = analyzeWorkflow(workflow);
+    const name = String(payload?.name || "").trim();
+    if (!name) throw new Error("工作流名称不能为空");
+    if (name.length > 120) throw new Error("工作流名称不能超过 120 个字符");
+    const id = String(payload?.id || `workflow-${randomUUID()}`).trim();
+    if (!/^[a-z0-9][a-z0-9._-]{2,95}$/i.test(id)) throw new Error("工作流 ID 无效");
+    if (records.has(id)) throw new Error("工作流 ID 已存在");
+    const configuredAnalysis = analyzeWorkflow(workflow, null, payload?.fields);
+    const primaryOutputNodeId = String(payload?.primaryOutputNodeId || configuredAnalysis.suggestedPrimaryOutputNodeId || "");
+    if (!configuredAnalysis.outputs.some((item) => item.nodeId === primaryOutputNodeId)) throw new Error("主视频输出节点无效");
+    const now = Date.now();
+    const definition = {
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      id,
+      name,
+      description: String(payload?.description || "").trim().slice(0, 500),
+      sourceFileName: String(payload?.sourceFileName || "workflow-api.json").split(/[\\/]/).pop().slice(0, 240),
+      hash: baseAnalysis.hash,
+      fields: configuredAnalysis.fields,
+      outputs: configuredAnalysis.outputs,
+      primaryOutputNodeId,
+      createdAt: now,
+      updatedAt: now
     };
-  }
-
-  function get(id, mode, keyframeCount = null) {
-    const normalizedId = String(id || DEFAULT_WORKFLOW_PRESET_ID).trim();
-    const preset = presets.get(normalizedId);
-    if (!preset) throw new Error(`工作流预设不存在或未通过验证：${normalizedId}`);
-    const modeEntry = preset.modes[mode];
-    if (!modeEntry) throw new Error(`工作流预设 ${normalizedId} 不支持模式 ${mode}`);
-    const entry = mode === "keyframe" ? modeEntry.variants[keyframeCount] : modeEntry;
-    if (!entry) throw new Error(`工作流预设 ${normalizedId} 不支持 ${keyframeCount} 个关键帧`);
-    return { preset, entry };
-  }
-
-  return { refresh, list, get };
-}
-
-export function frameCountForDuration(duration) {
-  const requested = Math.max(5, Math.round(finiteNumber(duration, 10, 1, 60) * GENERATION_FPS));
-  return requested + ((5 - (requested % 17) + 17) % 17);
-}
-
-export function normalizeKeyframes(values) {
-  const duration = finiteNumber(values?.duration ?? values?.sliceDuration, 10, 1, 60);
-  let raw = Array.isArray(values?.keyframes) ? values.keyframes : null;
-  if (!raw && values?.keyframeA && values?.keyframeB && values?.keyframeC) {
-    const legacyFps = finiteNumber(values.fps, GENERATION_FPS, 1, 120);
-    raw = [
-      { ref: "K1", image: values.keyframeA, timeSeconds: 0 },
-      { ref: "K2", image: values.keyframeB, timeSeconds: finiteNumber(values.keyframeIndexB, 120, 0, 4096) / legacyFps },
-      { ref: "K3", image: values.keyframeC, timeSeconds: finiteNumber(values.keyframeIndexC, 216, 0, 4096) / legacyFps }
-    ];
-  }
-  if (!Array.isArray(raw) || raw.length < 1 || raw.length > 3) throw new Error("关键帧模式需要 1-3 个关键帧");
-  const usedRefs = new Set();
-  const totalFrames = frameCountForDuration(duration);
-  const normalized = raw.map((item, index) => {
-    const requestedRef = String(item?.ref || `K${index + 1}`).replace(/^@/, "").toUpperCase();
-    const ref = /^K[1-3]$/.test(requestedRef) ? requestedRef : `K${index + 1}`;
-    if (usedRefs.has(ref)) throw new Error(`关键帧引用重复：@${ref}`);
-    usedRefs.add(ref);
-    const image = String(item?.image || "").trim();
-    if (!image) throw new Error(`@K${index + 1} 尚未上传图片`);
-    const timeSeconds = Number(item?.timeSeconds);
-    if (!Number.isFinite(timeSeconds) || timeSeconds < 0 || timeSeconds >= duration) throw new Error(`@K${index + 1} 时间必须在 0（含）到 ${duration} 秒（不含）之间`);
-    const frameIndex = Math.round(timeSeconds * GENERATION_FPS);
-    if (frameIndex >= totalFrames) throw new Error(`@${ref} 取整后超出总帧数 ${totalFrames}`);
-    return { ref, image, timeSeconds, frameIndex };
-  });
-  const frames = new Set();
-  for (const item of normalized) {
-    if (frames.has(item.frameIndex)) throw new Error(`关键帧时间取整后重复在第 ${item.frameIndex} 帧，请至少错开 1/24 秒`);
-    frames.add(item.frameIndex);
-  }
-  return normalized.sort((a, b) => a.frameIndex - b.frameIndex);
-}
-
-function setBinding(workflow, binding, value, label) {
-  const node = workflow[binding.node];
-  if (!node?.inputs || !Object.hasOwn(node.inputs, binding.input)) throw new Error(`工作流绑定失效：${label}`);
-  node.inputs[binding.input] = value;
-}
-
-export function configureWorkflow({ entry, mode, values, taskId }) {
-  const workflow = clone(entry.workflow);
-  const bindings = entry.bindings;
-  const prompt = String(values?.prompt || "").trim();
-  if (!prompt) throw new Error("提示词不能为空");
-  const resolution = RESOLUTION_PRESETS[values?.resolutionPreset] || RESOLUTION_PRESETS.balanced;
-  const legacyDuration = Number(values?.length) > 0 && Number(values?.fps) > 0 ? Number(values.length) / Number(values.fps) : undefined;
-  const duration = finiteNumber(values?.duration ?? values?.sliceDuration ?? legacyDuration, mode === "t2v" ? 5 : 10, 1, 60);
-  const seed = integer(values?.seed, Math.floor(Math.random() * Number.MAX_SAFE_INTEGER), 0, Number.MAX_SAFE_INTEGER);
-  const assign = (name, value) => setBinding(workflow, bindings[name], value, name);
-
-  assign("prompt", prompt);
-  assign("width", resolution.width);
-  assign("height", resolution.height);
-  assign("fps", GENERATION_FPS);
-  assign("bitDepth", integer(values?.bitDepth, 8, 8, 16));
-  assign("steps", integer(values?.steps, 20, 1, 200));
-  assign("denoise", finiteNumber(values?.denoise, 1, 0, 1));
-  assign("scheduler", String(values?.scheduler || "simple"));
-  assign("sampler", String(values?.sampler || "res_multistep"));
-  assign("seed", seed);
-  assign("unetName", String(values?.unetName || "minimax_h3_fl2va_pruned_int8_convrot.safetensors"));
-  assign("weightDtype", String(values?.weightDtype || "default"));
-  assign("clipName", String(values?.clipName || "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"));
-  assign("clipDevice", String(values?.clipDevice || "default"));
-  assign("videoVae", String(values?.videoVae || "minimax_h3_video_vae_fp16.safetensors"));
-  assign("audioVae", String(values?.audioVae || "minimax_h3_audio_vae_fp32.safetensors"));
-  assign("sliceDuration", duration);
-  assign("sliceStrict", true);
-  assign("format", ["mp4", "webm", "mkv", "auto"].includes(values?.format) ? values.format : "mp4");
-  assign("codec", String(values?.codec || "auto"));
-  assign("prefix", `video/DSH_${mode}_${Date.now()}_${taskId.slice(0, 8)}`);
-
-  let keyframes = [];
-  let frameCount = frameCountForDuration(duration);
-  if (mode === "keyframe") {
-    keyframes = normalizeKeyframes({ ...values, duration });
-    if (bindings.images.length !== keyframes.length || bindings.guides.length !== keyframes.length) throw new Error("关键帧数量与工作流变体不一致");
-    assign("length", frameCount);
-    keyframes.forEach((item, index) => {
-      setBinding(workflow, bindings.images[index], item.image, `images.${index}`);
-      setBinding(workflow, bindings.guides[index], item.frameIndex, `guides.${index}`);
-    });
-  } else {
-    assign("duration", duration);
-    if (mode === "i2v") {
-      const image = String(values?.image || "").trim();
-      if (!image) throw new Error("图生视频必须先上传参考图");
-      assign("image", image);
+    const folder = safeDirectory(root, id);
+    await mkdir(root, { recursive: true });
+    await mkdir(folder, { recursive: false });
+    try {
+      await atomicWrite(resolve(folder, "workflow.json"), workflow);
+      await atomicWrite(resolve(folder, "definition.json"), definition);
+    } catch (error) {
+      await rm(folder, { recursive: true, force: true }).catch(() => {});
+      throw error;
     }
+    records.set(id, { definition, workflow });
+    return get(id);
   }
-  return { workflow, prompt, duration, resolution, frameCount, keyframes };
+
+  async function update(id, payload) {
+    const record = records.get(String(id || ""));
+    if (!record) throw new Error("工作流不存在");
+    const analysis = analyzeWorkflow(record.workflow, null, payload?.fields ?? record.definition.fields);
+    const primaryOutputNodeId = String(payload?.primaryOutputNodeId ?? record.definition.primaryOutputNodeId);
+    if (!analysis.outputs.some((item) => item.nodeId === primaryOutputNodeId)) throw new Error("主视频输出节点无效");
+    const name = String(payload?.name ?? record.definition.name).trim();
+    if (!name || name.length > 120) throw new Error("工作流名称无效");
+    record.definition = {
+      ...record.definition,
+      name,
+      description: String(payload?.description ?? record.definition.description).trim().slice(0, 500),
+      fields: analysis.fields,
+      outputs: analysis.outputs,
+      primaryOutputNodeId,
+      updatedAt: Date.now()
+    };
+    await atomicWrite(resolve(safeDirectory(root, record.definition.id), "definition.json"), record.definition);
+    return get(record.definition.id);
+  }
+
+  async function remove(id) {
+    const key = String(id || "");
+    if (!records.has(key)) throw new Error("工作流不存在");
+    await rm(safeDirectory(root, key), { recursive: true, force: false });
+    records.delete(key);
+    return { removed: 1 };
+  }
+
+  return { load, list, get, save, update, remove };
 }

@@ -4,35 +4,26 @@ import { homedir } from "node:os";
 import { dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { Agent } from "undici";
 import WebSocket from "ws";
 import {
-  DEFAULT_WORKFLOW_PRESET_ID,
-  GENERATION_FPS,
-  RESOLUTION_PRESETS,
-  configureWorkflow,
+  analyzeWorkflow,
+  applyWorkflowValues,
   createWorkflowRegistry,
-  normalizeKeyframes
+  parseApiWorkflow
 } from "./workflow-presets.js";
 
 const PLUGIN_ID = "dsh-comfy-video-studio";
 const API_PREFIX = "/comfy-video/api";
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const builtInWorkflowManifest = join(root, "assets", "workflows", "minimax-h3-default.preset.json");
-const DEFAULT_VIDEO_RULES = Object.freeze({
-  smooth_rotation: "镜头转动平滑连续，非明确要求时停顿不超过 500ms",
-  portrait_9_16: "默认采用 9:16 手机竖屏画面",
-  handheld_motion: "运镜带轻微、自然的手机手持抖动",
-  fixed_body_direction: "镜头转动时人物头部和身体方向不跟随镜头",
-  fixed_gaze: "人物视线保持原方向，不追随镜头",
-  natural_blink: "人物平均每 3-8 秒自然眨眼一次；短于 3 秒不强制眨眼"
-});
-const DEFAULT_VIDEO_RULE_IDS = Object.freeze(Object.keys(DEFAULT_VIDEO_RULES));
-const DEFAULT_CONNECTION_PRESET_ID = "default";
+const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+const ACTIVE = new Set(["submitting", "remote_queued", "running", "finalizing", "writing"]);
 
-export const inject = ["webServer", "llm", "agents"];
+export const inject = ["webServer"];
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
 
 function json(res, status, value) {
   const body = Buffer.from(JSON.stringify(value));
@@ -45,8 +36,8 @@ function json(res, status, value) {
 }
 
 function publicError(error) {
-  if (error instanceof Error) return error.message;
-  return String(error);
+  if (error?.name === "AbortError") return "请求超时";
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function readBody(req, limit) {
@@ -54,174 +45,29 @@ async function readBody(req, limit) {
   let total = 0;
   for await (const chunk of req) {
     total += chunk.length;
-    if (total > limit) throw new Error(`request body exceeds ${limit} bytes`);
+    if (total > limit) throw new Error(`请求体超过 ${limit} 字节限制`);
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
 }
 
-async function readJson(req, limit = 1024 * 1024) {
-  const body = await readBody(req, limit);
-  if (body.length === 0) return {};
-  try {
-    return JSON.parse(body.toString("utf8"));
-  } catch {
-    throw new Error("request body is not valid JSON");
-  }
+async function readJson(req, limit = 8 * 1024 * 1024) {
+  const bytes = await readBody(req, limit);
+  if (bytes.length === 0) return {};
+  try { return JSON.parse(bytes.toString("utf8")); }
+  catch { throw new Error("请求体不是有效 JSON"); }
+}
+
+function integer(value, fallback, min, max) {
+  const number = Math.round(Number(value));
+  return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback;
 }
 
 function normalizeBaseUrl(value) {
   const parsed = new URL(value);
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error("ComfyUI baseUrl must use http or https");
-  }
-  if (parsed.username || parsed.password) {
-    throw new Error("ComfyUI baseUrl 不能包含用户名或密码，请在反向代理中配置认证");
-  }
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("ComfyUI 地址必须使用 http 或 https");
+  if (parsed.username || parsed.password) throw new Error("ComfyUI 地址不能包含用户名或密码，请由反向代理处理认证");
   return parsed.toString().replace(/\/$/, "");
-}
-
-function createConnectionCatalog(rawConfig, fallbackBaseUrl, storageFile, logger) {
-  const configured = rawConfig.connectionPresets;
-  const source = configured === undefined ? [{
-    id: DEFAULT_CONNECTION_PRESET_ID,
-    name: "默认 ComfyUI",
-    baseUrl: fallbackBaseUrl
-  }] : configured;
-  if (!Array.isArray(source) || source.length === 0) {
-    throw new Error("connectionPresets 必须是非空数组");
-  }
-  const presets = new Map();
-  const configuredIds = new Set();
-  const retired = new Set();
-  let writeChain = Promise.resolve();
-
-  function materialize(item, origin) {
-    const id = String(item?.id ?? "").trim();
-    const name = String(item?.name ?? "").trim();
-    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(id)) {
-      throw new Error(`ComfyUI 连接预设 ID 无效：${id || "<empty>"}`);
-    }
-    if (!name || name.length > 120) throw new Error(`ComfyUI 连接预设名称无效：${id}`);
-    const baseUrl = normalizeBaseUrl(item?.baseUrl);
-    const allowSelfSigned = item?.allowSelfSigned === true;
-    if (allowSelfSigned && !baseUrl.startsWith("https:")) {
-      throw new Error(`allowSelfSigned 仅适用于 HTTPS 连接：${id}`);
-    }
-    return {
-      id,
-      name,
-      baseUrl,
-      allowSelfSigned,
-      origin,
-      dispatcher: allowSelfSigned ? new Agent({ connect: { rejectUnauthorized: false } }) : null
-    };
-  }
-
-  function publicPreset({ id, name, baseUrl, allowSelfSigned, origin }) {
-    return { id, name, baseUrl, allowSelfSigned, mutable: origin === "runtime" };
-  }
-
-  for (const item of source) {
-    const preset = materialize(item, "configured");
-    if (presets.has(preset.id)) throw new Error(`ComfyUI 连接预设 ID 重复：${preset.id}`);
-    configuredIds.add(preset.id);
-    presets.set(preset.id, preset);
-  }
-  let defaultId = String(rawConfig.defaultConnectionPresetId ?? source[0].id).trim();
-  if (!presets.has(defaultId)) throw new Error(`默认 ComfyUI 连接预设不存在：${defaultId}`);
-
-  function persist() {
-    const payload = {
-      version: 1,
-      defaultId,
-      presets: [...presets.values()].filter((item) => item.origin === "runtime").map(publicPreset)
-    };
-    writeChain = writeChain.catch(() => {}).then(async () => {
-      await mkdir(dirname(storageFile), { recursive: true });
-      const temporary = `${storageFile}.partial-${process.pid}`;
-      await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-      await rename(temporary, storageFile);
-    });
-    return writeChain;
-  }
-
-  return {
-    get defaultId() { return defaultId; },
-    async load() {
-      let parsed;
-      try {
-        parsed = JSON.parse(await readFile(storageFile, "utf8"));
-      } catch (error) {
-        if (error?.code !== "ENOENT") logger?.warn?.(`[${PLUGIN_ID}] connection preset load failed: ${publicError(error)}`);
-        return;
-      }
-      const seen = new Set();
-      for (const item of Array.isArray(parsed?.presets) ? parsed.presets : []) {
-        try {
-          const preset = materialize(item, "runtime");
-          if (configuredIds.has(preset.id) || seen.has(preset.id)) throw new Error(`ComfyUI 连接预设 ID 重复：${preset.id}`);
-          seen.add(preset.id);
-          presets.set(preset.id, preset);
-        } catch (error) {
-          logger?.warn?.(`[${PLUGIN_ID}] ignored invalid runtime connection preset: ${publicError(error)}`);
-        }
-      }
-      const savedDefault = String(parsed?.defaultId || "").trim();
-      if (presets.has(savedDefault)) defaultId = savedDefault;
-    },
-    get(id) {
-      const requested = String(id || defaultId).trim();
-      const preset = presets.get(requested);
-      if (!preset) throw new Error(`未知的 ComfyUI 连接预设：${requested}`);
-      return preset;
-    },
-    list() {
-      return {
-        defaultId,
-        storageFile,
-        presets: [...presets.values()].map(publicPreset)
-      };
-    },
-    preview(payload) {
-      return materialize({
-        id: "preview",
-        name: String(payload?.name || "待测试连接"),
-        baseUrl: payload?.baseUrl,
-        allowSelfSigned: payload?.allowSelfSigned
-      }, "preview");
-    },
-    async save(payload) {
-      const requestedId = String(payload?.id || "").trim();
-      const id = requestedId || `connection-${randomUUID()}`;
-      if (configuredIds.has(id)) throw new Error("内置或静态连接预设不能在页面修改");
-      const preset = materialize({ ...payload, id }, "runtime");
-      const previous = presets.get(id);
-      if (previous?.dispatcher) retired.add(previous.dispatcher);
-      presets.set(id, preset);
-      if (payload?.makeDefault === true) defaultId = id;
-      await persist();
-      return publicPreset(preset);
-    },
-    async remove(id) {
-      const requested = String(id || "").trim();
-      if (configuredIds.has(requested)) throw new Error("内置或静态连接预设不能删除");
-      const previous = presets.get(requested);
-      if (!previous) throw new Error("连接预设不存在");
-      presets.delete(requested);
-      if (previous.dispatcher) retired.add(previous.dispatcher);
-      if (defaultId === requested) defaultId = presets.keys().next().value;
-      await persist();
-      return { removed: 1, defaultId };
-    },
-    async close() {
-      const dispatchers = new Set([
-        ...[...presets.values()].map((item) => item.dispatcher).filter(Boolean),
-        ...retired
-      ]);
-      await Promise.all([...dispatchers].map((dispatcher) => dispatcher.close()));
-    }
-  };
 }
 
 function websocketUrl(baseUrl, clientId) {
@@ -237,24 +83,138 @@ function publicConnection(connection) {
     id: connection.id,
     name: connection.name,
     baseUrl: connection.baseUrl,
-    allowSelfSigned: connection.allowSelfSigned === true
+    allowSelfSigned: connection.allowSelfSigned === true,
+    maxConcurrency: connection.maxConcurrency,
+    mutable: connection.origin === "runtime"
   };
 }
 
-function finiteNumber(value, fallback, min, max) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return fallback;
-  return Math.min(max, Math.max(min, number));
-}
+function createConnectionCatalog(rawConfig, fallbackBaseUrl, storageFile, logger, onChange) {
+  const source = Array.isArray(rawConfig.connectionPresets) && rawConfig.connectionPresets.length
+    ? rawConfig.connectionPresets
+    : [{ id: "default", name: "默认 ComfyUI", baseUrl: fallbackBaseUrl, maxConcurrency: 1 }];
+  const presets = new Map();
+  const configuredIds = new Set();
+  const retiredDispatchers = new Set();
+  let writeChain = Promise.resolve();
+  let defaultId = String(rawConfig.defaultConnectionPresetId || source[0].id);
 
-function integer(value, fallback, min, max) {
-  return Math.round(finiteNumber(value, fallback, min, max));
-}
+  function materialize(item, origin) {
+    const id = String(item?.id || "").trim();
+    const name = String(item?.name || "").trim();
+    if (!/^[a-z0-9][a-z0-9._-]{0,95}$/i.test(id)) throw new Error("连接 ID 无效");
+    if (!name || name.length > 120) throw new Error("连接名称无效");
+    const baseUrl = normalizeBaseUrl(item?.baseUrl);
+    const allowSelfSigned = item?.allowSelfSigned === true;
+    if (allowSelfSigned && !baseUrl.startsWith("https:")) throw new Error("自签名证书选项只适用于 HTTPS");
+    return {
+      id,
+      name,
+      baseUrl,
+      allowSelfSigned,
+      maxConcurrency: integer(item?.maxConcurrency, 1, 1, 3),
+      origin,
+      dispatcher: allowSelfSigned ? new Agent({ connect: { rejectUnauthorized: false } }) : null
+    };
+  }
 
-function outputDirectory(values) {
-  const outputDirectory = String(values.outputDirectory ?? "").trim();
-  if (!isAbsolute(outputDirectory)) throw new Error("输出目录必须是远程主机上的绝对路径");
-  return outputDirectory;
+  for (const item of source) {
+    const preset = materialize(item, "configured");
+    if (presets.has(preset.id)) throw new Error(`连接 ID 重复：${preset.id}`);
+    configuredIds.add(preset.id);
+    presets.set(preset.id, preset);
+  }
+  if (!presets.has(defaultId)) defaultId = presets.keys().next().value;
+
+  function persist() {
+    const payload = {
+      version: 2,
+      defaultId,
+      presets: [...presets.values()].filter((item) => item.origin === "runtime").map(publicConnection),
+      configuredConcurrency: Object.fromEntries([...presets.values()].filter((item) => item.origin === "configured").map((item) => [item.id, item.maxConcurrency]))
+    };
+    writeChain = writeChain.catch(() => {}).then(async () => {
+      await mkdir(dirname(storageFile), { recursive: true });
+      const temporary = `${storageFile}.partial-${process.pid}-${randomUUID()}`;
+      await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+      await rename(temporary, storageFile);
+    });
+    return writeChain;
+  }
+
+  async function load() {
+    let parsed;
+    try { parsed = JSON.parse(await readFile(storageFile, "utf8")); }
+    catch (error) {
+      if (error?.code !== "ENOENT") logger?.warn?.(`[${PLUGIN_ID}] connection load failed: ${publicError(error)}`);
+      return;
+    }
+    for (const item of Array.isArray(parsed?.presets) ? parsed.presets : []) {
+      try {
+        const preset = materialize(item, "runtime");
+        if (configuredIds.has(preset.id)) throw new Error(`运行时连接与静态连接 ID 冲突：${preset.id}`);
+        presets.set(preset.id, preset);
+      } catch (error) {
+        logger?.warn?.(`[${PLUGIN_ID}] ignored connection: ${publicError(error)}`);
+      }
+    }
+    for (const [id, value] of Object.entries(parsed?.configuredConcurrency || {})) {
+      const preset = presets.get(id);
+      if (preset?.origin === "configured") preset.maxConcurrency = integer(value, preset.maxConcurrency, 1, 3);
+    }
+    if (presets.has(parsed?.defaultId)) defaultId = parsed.defaultId;
+  }
+
+  function get(id) {
+    const key = String(id || defaultId);
+    const connection = presets.get(key);
+    if (!connection) throw new Error(`ComfyUI 连接不存在：${key}`);
+    return connection;
+  }
+
+  async function save(payload) {
+    const requestedId = String(payload?.id || "").trim();
+    if (requestedId && configuredIds.has(requestedId)) throw new Error("静态连接不能在页面修改");
+    const id = requestedId || `connection-${randomUUID()}`;
+    const next = materialize({ ...payload, id }, "runtime");
+    const previous = presets.get(id);
+    if (previous?.dispatcher) retiredDispatchers.add(previous.dispatcher);
+    presets.set(id, next);
+    if (payload?.makeDefault === true) defaultId = id;
+    await persist();
+    onChange?.(id);
+    return { preset: publicConnection(next), catalog: list() };
+  }
+
+  async function updateQueue(id, maxConcurrency) {
+    const connection = get(id);
+    connection.maxConcurrency = integer(maxConcurrency, connection.maxConcurrency, 1, 3);
+    await persist();
+    onChange?.(connection.id);
+    return publicConnection(connection);
+  }
+
+  async function remove(id) {
+    const connection = get(id);
+    if (connection.origin !== "runtime") throw new Error("静态连接不能删除");
+    presets.delete(connection.id);
+    if (connection.dispatcher) retiredDispatchers.add(connection.dispatcher);
+    if (defaultId === connection.id) defaultId = presets.keys().next().value;
+    await persist();
+    onChange?.(connection.id);
+    return { removed: 1, defaultId };
+  }
+
+  function list() {
+    return { defaultId, storageFile, presets: [...presets.values()].map(publicConnection) };
+  }
+
+  async function close() {
+    const dispatchers = new Set([...presets.values(), ...[...retiredDispatchers].map((dispatcher) => ({ dispatcher }))].map((item) => item.dispatcher).filter(Boolean));
+    await Promise.all([...dispatchers].map((dispatcher) => dispatcher.close()));
+  }
+
+  return { load, get, save, updateQueue, remove, list, close };
 }
 
 function contentType(filename) {
@@ -268,330 +228,107 @@ function contentType(filename) {
   }
 }
 
-function findMedia(value, result = []) {
+function findVideos(value, nodeId, result = []) {
   if (Array.isArray(value)) {
-    for (const item of value) findMedia(item, result);
+    for (const item of value) findVideos(item, nodeId, result);
     return result;
   }
   if (!value || typeof value !== "object") return result;
-  if (
-    typeof value.filename === "string" &&
-    /\.(mp4|webm|mov|mkv|gif)$/i.test(value.filename)
-  ) {
+  if (typeof value.filename === "string" && /\.(mp4|webm|mov|mkv|gif)$/i.test(value.filename)) {
     result.push({
+      nodeId: String(nodeId),
       filename: value.filename,
       subfolder: typeof value.subfolder === "string" ? value.subfolder : "",
       type: typeof value.type === "string" ? value.type : "output"
     });
   }
-  for (const item of Object.values(value)) findMedia(item, result);
+  for (const item of Object.values(value)) findVideos(item, nodeId, result);
   return result;
 }
 
-async function availablePath(directory, filename, taskId) {
-  const safeName = filename.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
-  const parsed = extname(safeName);
-  const stem = safeName.slice(0, safeName.length - parsed.length);
-  let candidate = join(directory, safeName);
-  try {
-    await access(candidate);
-    candidate = join(directory, `${stem}-${taskId.slice(0, 8)}${parsed}`);
-  } catch {
-    return candidate;
-  }
+function videoDescriptors(outputs) {
+  const result = [];
+  for (const [nodeId, value] of Object.entries(outputs || {})) findVideos(value, nodeId, result);
+  return result;
+}
+
+async function availablePath(directory, filename, suffix) {
+  const safe = filename.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
+  const extension = extname(safe);
+  const stem = safe.slice(0, safe.length - extension.length);
+  let candidate = join(directory, safe);
+  try { await access(candidate); candidate = join(directory, `${stem}-${suffix}${extension}`); }
+  catch { return candidate; }
   return candidate;
 }
 
 function taskView(task) {
+  const outputs = Array.isArray(task.outputs) ? task.outputs.map((item, index) => ({
+    ...item,
+    videoUrl: item.outputPath ? `${API_PREFIX}/video/${encodeURIComponent(task.id)}/${index}` : null
+  })) : [];
+  const primaryIndex = Math.max(0, outputs.findIndex((item) => item.nodeId === task.primaryOutputNodeId));
   return {
     id: task.id,
     promptId: task.promptId,
-    mode: task.mode,
-    prompt: task.prompt,
+    workflowId: task.workflowId,
+    workflowName: task.workflowName,
+    workflowHash: task.workflowHash,
     connectionPresetId: task.connection.id,
     connectionName: task.connection.name,
     connectionBaseUrl: task.connection.baseUrl,
-    connectionAllowSelfSigned: task.connection.allowSelfSigned,
-    workflowPresetId: task.workflowPresetId,
-    resolutionPreset: task.resolutionPreset,
-    keyframes: task.keyframes,
-    frameCount: task.frameCount,
     status: task.status,
     stage: task.stage,
     currentNode: task.currentNode,
     progress: task.progress,
     queueRemaining: task.queueRemaining,
     outputDirectory: task.outputDirectory,
-    outputPath: task.outputPath,
-    videoUrl: task.outputPath ? `${API_PREFIX}/video/${encodeURIComponent(task.id)}` : null,
+    outputs,
+    primaryOutputNodeId: task.primaryOutputNodeId,
+    videoUrl: outputs[primaryIndex]?.videoUrl || null,
     error: task.error,
+    warning: task.warning || null,
+    legacy: task.legacy === true,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt
   };
 }
 
-function touch(task, patch) {
-  Object.assign(task, patch, { updatedAt: Date.now() });
-  task.onChange?.();
-}
-
-function finishError(finish) {
-  if (!finish) return new Error("模型没有返回终止状态");
-  if (finish.kind === "stop") return null;
-  if (finish.kind === "max-tokens") return new Error("提示词优化输出超过模型上限");
-  if (finish.kind === "aborted") return new Error("提示词优化已取消");
-  if (finish.kind === "error") return new Error(finish.failure?.message ?? "模型调用失败");
-  return new Error(`提示词优化异常结束：${finish.kind}`);
-}
-
-function userMessage(text) {
-  return Object.freeze({
-    id: randomUUID(),
-    role: "user",
-    content: Object.freeze([Object.freeze({ type: "text", text })]),
-    source: Object.freeze({ kind: "plugin", plugin: PLUGIN_ID })
-  });
-}
-
-function parseOptimizationDecision(raw) {
-  const normalized = String(raw ?? "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
-  const start = normalized.indexOf("{");
-  const end = normalized.lastIndexOf("}");
-  if (start < 0 || end <= start) throw new Error("模型未按约定返回优化决策，请重试");
-
-  let value;
-  try {
-    value = JSON.parse(normalized.slice(start, end + 1));
-  } catch {
-    throw new Error("模型返回的优化决策不是有效 JSON，请重试");
-  }
-
-  if (value?.decision === "clarify") {
-    const questions = Array.isArray(value.questions)
-      ? value.questions.map((item) => String(item ?? "").trim()).filter(Boolean).slice(0, 3)
-      : [];
-    if (questions.length === 0) throw new Error("模型认为需要澄清，但没有给出具体问题");
-    return {
-      decision: "clarify",
-      questions,
-      reason: String(value.reason ?? "关键信息会影响视频结果").trim()
-    };
-  }
-
-  if (value?.decision === "ready") {
-    const prompt = String(value.prompt ?? "").trim();
-    if (!prompt) throw new Error("模型没有返回优化后的提示词");
-    const appliedRules = Array.isArray(value.appliedRules)
-      ? [...new Set(value.appliedRules.map(String).filter((id) => DEFAULT_VIDEO_RULE_IDS.includes(id)))]
-      : [];
-    const overriddenRules = value.overriddenRules && typeof value.overriddenRules === "object" && !Array.isArray(value.overriddenRules)
-      ? Object.fromEntries(Object.entries(value.overriddenRules)
-        .filter(([id, reason]) => DEFAULT_VIDEO_RULE_IDS.includes(id) && String(reason ?? "").trim())
-        .map(([id, reason]) => [id, String(reason).trim()]))
-      : {};
-    const duplicatedRules = appliedRules.filter((id) => Object.hasOwn(overriddenRules, id));
-    if (duplicatedRules.length > 0) throw new Error(`默认规则不能同时标记为应用和覆盖：${duplicatedRules.join(", ")}`);
-    const covered = new Set([...appliedRules, ...Object.keys(overriddenRules)]);
-    const missingRules = DEFAULT_VIDEO_RULE_IDS.filter((id) => !covered.has(id));
-    if (missingRules.length > 0) {
-      const error = new Error(`模型未说明默认规则：${missingRules.join(", ")}`);
-      error.code = "DEFAULT_RULES_INCOMPLETE";
-      error.missingRules = missingRules;
-      throw error;
-    }
-    return {
-      decision: "ready",
-      prompt,
-      summary: String(value.summary ?? "已补全画面、动作、镜头和节奏").trim(),
-      appliedRules,
-      overriddenRules
-    };
-  }
-
-  throw new Error("模型返回了未知的优化决策，请重试");
+function outputDirectory(value) {
+  const directory = String(value || "").trim();
+  if (!isAbsolute(directory)) throw new Error("输出目录必须是 DeepSeek Harness 主机上的绝对路径");
+  return resolve(directory);
 }
 
 export function apply(ctx, rawConfig = {}) {
   const dshHome = resolve(process.env.DSH_HOME || join(homedir(), ".dsh"));
   const config = {
-    baseUrl: rawConfig.baseUrl ?? "http://127.0.0.1:8188",
-    maxUploadMb: rawConfig.maxUploadMb ?? 40,
-    requestTimeoutMs: rawConfig.requestTimeoutMs ?? 30000,
+    baseUrl: rawConfig.baseUrl || "http://127.0.0.1:8188",
+    maxUploadMb: Number(rawConfig.maxUploadMb || 100),
+    maxWorkflowMb: Number(rawConfig.maxWorkflowMb || 5),
+    requestTimeoutMs: integer(rawConfig.requestTimeoutMs, 30000, 1000, 300000),
     historyLimit: integer(rawConfig.historyLimit, 200, 10, 2000),
     historyFile: resolve(rawConfig.historyFile || join(dshHome, "storages", PLUGIN_ID, "history.json")),
     connectionsFile: resolve(rawConfig.connectionsFile || join(dshHome, "storages", PLUGIN_ID, "connections.json")),
     workflowDirectory: resolve(rawConfig.workflowDirectory || join(dshHome, "storages", PLUGIN_ID, "workflows"))
   };
-  const connectionCatalog = createConnectionCatalog(rawConfig, config.baseUrl, config.connectionsFile, ctx.logger);
-  const workflowRegistry = createWorkflowRegistry({
-    builtInManifest: builtInWorkflowManifest,
-    customDirectory: config.workflowDirectory,
-    logger: ctx.logger
-  });
-  let workflowReady = workflowRegistry.refresh();
-  const promptTemplates = new Map();
   const tasks = new Map();
   const sockets = new Set();
+  const objectInfoCache = new Map();
+  const dispatching = new Set();
   let disposed = false;
   let historyTimer = null;
   let historyWrite = Promise.resolve();
+  let retryTimer = null;
 
-  function taskRecord(task) {
-    return {
-      ...taskView(task),
-      clientId: task.clientId
-    };
-  }
-
-  function persistHistory() {
-    if (historyTimer) clearTimeout(historyTimer);
-    historyTimer = null;
-    const records = [...tasks.values()]
-      .sort((a, b) => b.createdAt - a.createdAt)
-      .slice(0, config.historyLimit)
-      .map(taskRecord);
-    historyWrite = historyWrite.catch(() => {}).then(async () => {
-      await mkdir(dirname(config.historyFile), { recursive: true });
-      const temporary = `${config.historyFile}.partial-${process.pid}`;
-      const savedTemplates = [...promptTemplates.values()].sort((a, b) => b.updatedAt - a.updatedAt);
-      await writeFile(temporary, `${JSON.stringify({ version: 2, tasks: records, templates: savedTemplates }, null, 2)}\n`, "utf8");
-      await rename(temporary, config.historyFile);
-    });
-    return historyWrite;
-  }
-
-  function scheduleHistory() {
-    if (disposed || historyTimer) return;
-    historyTimer = setTimeout(() => {
-      historyTimer = null;
-      void persistHistory().catch((error) => ctx.logger?.warn?.(`[${PLUGIN_ID}] history write failed: ${publicError(error)}`));
-    }, 250);
-  }
-
-  function hydrateTask(record) {
-    const status = ["connecting", "queued", "running", "finalizing", "writing", "completed", "failed", "cancelled"].includes(record?.status)
-      ? record.status
-      : "failed";
-    const connectionPresetId = String(record?.connectionPresetId || connectionCatalog.defaultId);
-    let configuredConnection = null;
-    try {
-      configuredConnection = connectionCatalog.get(connectionPresetId);
-    } catch {
-      if (!record?.connectionBaseUrl) configuredConnection = connectionCatalog.get();
-    }
-    const recordedBaseUrl = record?.connectionBaseUrl ? normalizeBaseUrl(record.connectionBaseUrl) : configuredConnection.baseUrl;
-    const recordedAllowSelfSigned = record?.connectionAllowSelfSigned === undefined
-      ? configuredConnection?.allowSelfSigned === true
-      : record.connectionAllowSelfSigned === true;
-    const connection = configuredConnection && recordedBaseUrl === configuredConnection.baseUrl && recordedAllowSelfSigned === configuredConnection.allowSelfSigned
-      ? configuredConnection
-      : {
-          id: connectionPresetId,
-          name: String(record?.connectionName || configuredConnection?.name || connectionPresetId),
-          baseUrl: recordedBaseUrl,
-          allowSelfSigned: recordedAllowSelfSigned,
-          dispatcher: recordedAllowSelfSigned ? new Agent({ connect: { rejectUnauthorized: false } }) : null,
-          ephemeral: true
-        };
-    return {
-      id: String(record?.id || randomUUID()),
-      promptId: record?.promptId ? String(record.promptId) : null,
-      clientId: String(record?.clientId || randomUUID()),
-      mode: ["t2v", "i2v", "keyframe"].includes(record?.mode) ? record.mode : "t2v",
-      prompt: String(record?.prompt || ""),
-      connection,
-      workflowPresetId: String(record?.workflowPresetId || DEFAULT_WORKFLOW_PRESET_ID),
-      resolutionPreset: RESOLUTION_PRESETS[record?.resolutionPreset] ? record.resolutionPreset : "balanced",
-      keyframes: Array.isArray(record?.keyframes) ? record.keyframes : [],
-      frameCount: Number.isInteger(record?.frameCount) ? record.frameCount : null,
-      outputDirectory: String(record?.outputDirectory || ""),
-      outputPath: record?.outputPath ? String(record.outputPath) : null,
-      status,
-      stage: String(record?.stage || "历史任务"),
-      currentNode: record?.currentNode ?? null,
-      progress: record?.progress && typeof record.progress === "object" ? record.progress : { value: 0, max: 0, percent: null },
-      queueRemaining: record?.queueRemaining ?? null,
-      error: record?.error ? String(record.error) : null,
-      createdAt: finiteNumber(record?.createdAt, Date.now(), 0, Number.MAX_SAFE_INTEGER),
-      updatedAt: finiteNumber(record?.updatedAt, Date.now(), 0, Number.MAX_SAFE_INTEGER),
-      socket: null,
-      poller: null,
-      finalizing: false,
-      onChange: scheduleHistory
-    };
-  }
-
-  async function loadHistory() {
-    let parsed;
-    try {
-      parsed = JSON.parse(await readFile(config.historyFile, "utf8"));
-    } catch (error) {
-      if (error?.code === "ENOENT") return;
-      ctx.logger?.warn?.(`[${PLUGIN_ID}] history load failed: ${publicError(error)}`);
-      return;
-    }
-    const records = Array.isArray(parsed?.tasks) ? parsed.tasks.slice(0, config.historyLimit) : [];
-    for (const record of records) {
-      const task = hydrateTask(record);
-      tasks.set(task.id, task);
-    }
-    for (const record of Array.isArray(parsed?.templates) ? parsed.templates : []) {
-      const id = String(record?.id || "").trim();
-      const name = String(record?.name || "").trim();
-      const prompt = String(record?.prompt || "").trim();
-      const mode = ["t2v", "i2v", "keyframe"].includes(record?.mode) ? record.mode : null;
-      if (!id || !name || !prompt || !mode) continue;
-      promptTemplates.set(id, {
-        id,
-        name: name.slice(0, 120),
-        prompt: prompt.slice(0, 20000),
-        mode,
-        createdAt: finiteNumber(record?.createdAt, Date.now(), 0, Number.MAX_SAFE_INTEGER),
-        updatedAt: finiteNumber(record?.updatedAt, Date.now(), 0, Number.MAX_SAFE_INTEGER)
-      });
-    }
-    for (const task of tasks.values()) {
-      if (["completed", "failed", "cancelled"].includes(task.status)) continue;
-      if (!task.promptId) {
-        touch(task, { status: "failed", stage: "Harness 重启后无法恢复尚未提交的任务", error: "任务在取得 ComfyUI prompt_id 前中断" });
-        continue;
-      }
-      touch(task, { stage: "Harness 已重启，正在恢复 ComfyUI 任务监控", error: null });
-      void connectSocket(task).catch((error) => {
-        touch(task, { stage: `恢复实时通道失败，继续轮询：${publicError(error)}`, error: null });
-      });
-      startHistoryFallback(task);
-    }
-  }
-
+  const scheduleConnection = (id) => {
+    objectInfoCache.clear();
+    queueMicrotask(() => void dispatchConnection(id));
+  };
+  const connectionCatalog = createConnectionCatalog(rawConfig, config.baseUrl, config.connectionsFile, ctx.logger, scheduleConnection);
+  const workflowRegistry = createWorkflowRegistry({ directory: config.workflowDirectory, logger: ctx.logger });
   const connectionReady = connectionCatalog.load();
-  const historyReady = connectionReady.then(loadHistory);
-
-  async function savePromptTemplate(payload) {
-    const name = String(payload?.name ?? "").trim();
-    const prompt = String(payload?.prompt ?? "").trim();
-    const mode = ["t2v", "i2v", "keyframe"].includes(payload?.mode) ? payload.mode : null;
-    if (!name) throw new Error("模板名称不能为空");
-    if (!prompt) throw new Error("模板提示词不能为空");
-    if (!mode) throw new Error("模板模式无效");
-    if (name.length > 120) throw new Error("模板名称不能超过 120 个字符");
-    if (prompt.length > 20000) throw new Error("模板提示词不能超过 20000 个字符");
-    const requestedId = String(payload?.id ?? "").trim();
-    const existing = requestedId ? promptTemplates.get(requestedId) : null;
-    if (requestedId && !existing) throw new Error("要更新的模板不存在");
-    const now = Date.now();
-    const record = {
-      id: existing?.id || randomUUID(),
-      name,
-      prompt,
-      mode,
-      createdAt: existing?.createdAt || now,
-      updatedAt: now
-    };
-    promptTemplates.set(record.id, record);
-    await persistHistory();
-    return record;
-  }
+  const workflowReady = workflowRegistry.load();
 
   async function comfy(connection, pathname, init = {}, timeoutMs = config.requestTimeoutMs) {
     const controller = new AbortController();
@@ -603,31 +340,193 @@ export function apply(ctx, rawConfig = {}) {
         ...(connection.dispatcher ? { dispatcher: connection.dispatcher } : {})
       });
       if (!response.ok) {
-        const detail = (await response.text()).slice(0, 1000);
+        const detail = (await response.text()).slice(0, 1200);
         throw new Error(`ComfyUI ${response.status}: ${detail || response.statusText}`);
       }
       return response;
-    } finally {
-      clearTimeout(timer);
+    } finally { clearTimeout(timer); }
+  }
+
+  async function comfyJson(connection, pathname, init, timeoutMs) {
+    return (await comfy(connection, pathname, init, timeoutMs)).json();
+  }
+
+  async function getObjectInfo(connection, force = false) {
+    const cacheKey = `${connection.id}\u0000${connection.baseUrl}`;
+    const cached = objectInfoCache.get(cacheKey);
+    if (!force && cached && Date.now() - cached.fetchedAt < 60000) return cached.value;
+    const value = await comfyJson(connection, "/object_info");
+    objectInfoCache.set(cacheKey, { value, fetchedAt: Date.now() });
+    return value;
+  }
+
+  async function inspectConnection(connection, includeObjectInfo = false) {
+    const startedAt = Date.now();
+    const [statsResult, queueResult] = await Promise.allSettled([
+      comfyJson(connection, "/system_stats"),
+      comfyJson(connection, "/queue")
+    ]);
+    if (statsResult.status === "rejected") throw statsResult.reason;
+    const queue = queueResult.status === "fulfilled" ? queueResult.value : null;
+    const result = {
+      ok: true,
+      status: queue ? "online" : "degraded",
+      connection: publicConnection(connection),
+      latencyMs: Date.now() - startedAt,
+      stats: statsResult.value,
+      queue: queue ? {
+        running: Array.isArray(queue.queue_running) ? queue.queue_running.length : 0,
+        pending: Array.isArray(queue.queue_pending) ? queue.queue_pending.length : 0
+      } : null,
+      queueError: queueResult.status === "rejected" ? publicError(queueResult.reason) : null,
+      checkedAt: Date.now()
+    };
+    if (includeObjectInfo) result.objectInfoNodeCount = Object.keys(await getObjectInfo(connection, true)).length;
+    return result;
+  }
+
+  async function inspectCompatibility(workflow, fields, connection, force = false) {
+    const objectInfo = await getObjectInfo(connection, force);
+    return analyzeWorkflow(workflow, objectInfo, fields);
+  }
+
+  function taskRecord(task) {
+    return {
+      ...taskView(task),
+      clientId: task.clientId,
+      values: clone(task.values || {}),
+      workflowSnapshot: task.workflowSnapshot ? clone(task.workflowSnapshot) : null,
+      fieldSnapshot: task.fieldSnapshot ? clone(task.fieldSnapshot) : null,
+      connectionSnapshot: publicConnection(task.connection)
+    };
+  }
+
+  function persistHistory() {
+    if (historyTimer) clearTimeout(historyTimer);
+    historyTimer = null;
+    const records = [...tasks.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, config.historyLimit).map(taskRecord);
+    historyWrite = historyWrite.catch(() => {}).then(async () => {
+      await mkdir(dirname(config.historyFile), { recursive: true });
+      const temporary = `${config.historyFile}.partial-${process.pid}-${randomUUID()}`;
+      await writeFile(temporary, `${JSON.stringify({ version: 3, tasks: records }, null, 2)}\n`, "utf8");
+      await rename(temporary, config.historyFile);
+    });
+    return historyWrite;
+  }
+
+  function scheduleHistory() {
+    if (disposed || historyTimer) return;
+    historyTimer = setTimeout(() => {
+      historyTimer = null;
+      void persistHistory().catch((error) => ctx.logger?.warn?.(`[${PLUGIN_ID}] history write failed: ${publicError(error)}`));
+    }, 200);
+  }
+
+  function touch(task, patch) {
+    Object.assign(task, patch, { updatedAt: Date.now() });
+    scheduleHistory();
+  }
+
+  function ephemeralConnection(record) {
+    const snapshot = record?.connectionSnapshot || {};
+    try {
+      const current = connectionCatalog.get(record?.connectionPresetId || snapshot.id);
+      if (!snapshot.baseUrl || current.baseUrl === snapshot.baseUrl && current.allowSelfSigned === (snapshot.allowSelfSigned === true)) return current;
+    } catch { /* fall through to the persisted task snapshot */ }
+    {
+      const allowSelfSigned = snapshot.allowSelfSigned === true;
+      return {
+        id: String(snapshot.id || record?.connectionPresetId || "retired"),
+        name: String(snapshot.name || record?.connectionName || "已删除连接"),
+        baseUrl: normalizeBaseUrl(snapshot.baseUrl || record?.connectionBaseUrl),
+        allowSelfSigned,
+        maxConcurrency: integer(snapshot.maxConcurrency, 1, 1, 3),
+        origin: "snapshot",
+        dispatcher: allowSelfSigned ? new Agent({ connect: { rejectUnauthorized: false } }) : null,
+        ephemeral: true
+      };
     }
   }
 
-  async function comfyJson(connection, pathname, init) {
-    const response = await comfy(connection, pathname, init);
-    return response.json();
+  function hydrateTask(record) {
+    const legacy = !record?.workflowSnapshot;
+    let status = String(record?.status || "failed");
+    if (status === "queued") status = record?.promptId ? "remote_queued" : legacy ? "failed" : "waiting";
+    if (status === "connecting") status = record?.promptId ? "remote_queued" : legacy ? "failed" : "waiting";
+    if (!["waiting", "submitting", "remote_queued", "running", "finalizing", "writing", "completed", "failed", "cancelled"].includes(status)) status = "failed";
+    if (status === "submitting" && !record?.promptId) status = "failed";
+    const outputs = Array.isArray(record?.outputs) ? record.outputs : record?.outputPath ? [{ nodeId: String(record.primaryOutputNodeId || "legacy"), outputPath: record.outputPath, filename: String(record.outputPath).split(/[\\/]/).pop() }] : [];
+    return {
+      id: String(record?.id || randomUUID()),
+      promptId: record?.promptId ? String(record.promptId) : null,
+      clientId: String(record?.clientId || randomUUID()),
+      workflowId: String(record?.workflowId || record?.workflowPresetId || "legacy"),
+      workflowName: String(record?.workflowName || record?.workflowPresetId || "旧版任务"),
+      workflowHash: String(record?.workflowHash || ""),
+      workflowSnapshot: record?.workflowSnapshot || null,
+      fieldSnapshot: Array.isArray(record?.fieldSnapshot) ? record.fieldSnapshot : null,
+      values: record?.values && typeof record.values === "object" ? record.values : {},
+      connection: ephemeralConnection(record),
+      primaryOutputNodeId: String(record?.primaryOutputNodeId || outputs[0]?.nodeId || ""),
+      outputDirectory: String(record?.outputDirectory || ""),
+      outputs,
+      status,
+      stage: status === "failed" && record?.status === "submitting" ? "Harness 重启时任务尚未取得 prompt_id" : String(record?.stage || "历史任务"),
+      currentNode: record?.currentNode ?? null,
+      progress: record?.progress || { value: 0, max: 0, percent: null },
+      queueRemaining: record?.queueRemaining ?? null,
+      error: status === "failed" && record?.status === "submitting" ? "为避免重复生成，未自动重提" : record?.error || null,
+      warning: record?.warning || null,
+      legacy,
+      createdAt: Number(record?.createdAt) || Date.now(),
+      updatedAt: Number(record?.updatedAt) || Date.now(),
+      socket: null,
+      poller: null,
+      finalizing: false
+    };
   }
 
-  async function copyOutput(task, descriptor) {
-    touch(task, { status: "writing", stage: "正在写入指定目录" });
+  async function loadHistory() {
+    let parsed;
+    try { parsed = JSON.parse(await readFile(config.historyFile, "utf8")); }
+    catch (error) {
+      if (error?.code !== "ENOENT") ctx.logger?.warn?.(`[${PLUGIN_ID}] history load failed: ${publicError(error)}`);
+      return;
+    }
+    for (const record of Array.isArray(parsed?.tasks) ? parsed.tasks.slice(0, config.historyLimit) : []) {
+      const task = hydrateTask(record);
+      tasks.set(task.id, task);
+    }
+    for (const task of tasks.values()) {
+      if (task.status === "waiting") scheduleConnection(task.connection.id);
+      else if (task.promptId && ACTIVE.has(task.status)) {
+        void connectSocket(task).catch(() => {});
+        startHistoryFallback(task);
+      }
+    }
+  }
+
+  const historyReady = Promise.all([connectionReady, workflowReady]).then(loadHistory);
+
+  async function upload(req, connection) {
+    const bytes = await readBody(req, Math.round(config.maxUploadMb * 1024 * 1024));
+    if (bytes.length === 0) throw new Error("上传文件为空");
+    const rawName = req.headers["x-file-name"];
+    const filename = decodeURIComponent(Array.isArray(rawName) ? rawName[0] : rawName || "input.bin").split(/[\\/]/).pop();
+    const mime = String(req.headers["content-type"] || "application/octet-stream");
+    const form = new FormData();
+    form.append("image", new Blob([bytes], { type: mime }), filename);
+    form.append("type", "input");
+    form.append("overwrite", "false");
+    return (await comfy(connection, "/upload/image", { method: "POST", body: form })).json();
+  }
+
+  async function copyOutput(task, descriptor, index) {
     await mkdir(task.outputDirectory, { recursive: true });
-    const filename = descriptor.filename.split(/[\\/]/).pop() || `video-${task.id}.mp4`;
-    const destination = await availablePath(task.outputDirectory, filename, task.id);
+    const filename = descriptor.filename.split(/[\\/]/).pop() || `video-${task.id}-${index}.mp4`;
+    const destination = await availablePath(task.outputDirectory, filename, `${task.id.slice(0, 8)}-${index}`);
     const temporary = `${destination}.partial-${task.id}`;
-    const params = new URLSearchParams({
-      filename: descriptor.filename,
-      subfolder: descriptor.subfolder,
-      type: descriptor.type
-    });
+    const params = new URLSearchParams({ filename: descriptor.filename, subfolder: descriptor.subfolder || "", type: descriptor.type || "output" });
     const response = await comfy(task.connection, `/view?${params}`, {}, 24 * 60 * 60 * 1000);
     if (!response.body) throw new Error("ComfyUI 视频响应没有内容");
     try {
@@ -637,44 +536,45 @@ export function apply(ctx, rawConfig = {}) {
       await unlink(temporary).catch(() => {});
       throw error;
     }
-    touch(task, {
-      status: "completed",
-      stage: "制作完成",
-      progress: { value: 1, max: 1, percent: 100 },
-      outputPath: destination
-    });
+    return { ...descriptor, outputPath: destination };
   }
 
   async function finalize(task) {
-    if (task.finalizing || task.status === "completed" || task.status === "failed") return;
+    if (task.finalizing || TERMINAL.has(task.status)) return;
     task.finalizing = true;
     try {
-      touch(task, { status: "finalizing", stage: "正在读取生成结果" });
+      touch(task, { status: "finalizing", stage: "正在读取工作流视频输出" });
       const history = await comfyJson(task.connection, `/history/${encodeURIComponent(task.promptId)}`);
       const record = history?.[task.promptId] ?? history;
-      const outputs = findMedia(record?.outputs ?? record);
-      if (outputs.length === 0) throw new Error("工作流已结束，但历史记录中没有找到视频输出");
-      await copyOutput(task, outputs[0]);
+      const descriptors = videoDescriptors(record?.outputs || {});
+      if (descriptors.length === 0) throw new Error("工作流已结束，但历史记录中没有视频输出");
+      touch(task, { status: "writing", stage: `正在保存 ${descriptors.length} 个视频输出` });
+      const saved = [];
+      for (let index = 0; index < descriptors.length; index += 1) saved.push(await copyOutput(task, descriptors[index], index));
+      const hasPrimary = saved.some((item) => item.nodeId === task.primaryOutputNodeId);
+      touch(task, {
+        status: "completed",
+        stage: "制作完成",
+        progress: { value: 1, max: 1, percent: 100 },
+        outputs: saved,
+        warning: hasPrimary ? null : "主输出节点没有返回视频，已显示第一个可用视频"
+      });
     } catch (error) {
-      touch(task, { status: "failed", stage: "落盘失败", error: publicError(error) });
+      touch(task, { status: "failed", stage: "结果处理失败", error: publicError(error) });
     } finally {
       task.finalizing = false;
       if (task.poller) clearInterval(task.poller);
       task.poller = null;
       task.socket?.close();
+      scheduleConnection(task.connection.id);
     }
   }
 
   function watchSocket(task, socket) {
     socket.on("message", (raw) => {
-      if (typeof raw !== "string" && !Buffer.isBuffer(raw)) return;
       let event;
-      try {
-        event = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
-      const data = event.data ?? {};
+      try { event = JSON.parse(raw.toString()); } catch { return; }
+      const data = event.data || {};
       if (data.prompt_id && task.promptId && data.prompt_id !== task.promptId) return;
       if (event.type === "status") {
         const remaining = data.status?.exec_info?.queue_remaining;
@@ -682,407 +582,274 @@ export function apply(ctx, rawConfig = {}) {
       } else if (event.type === "execution_start") {
         touch(task, { status: "running", stage: "ComfyUI 开始执行" });
       } else if (event.type === "executing") {
-        if (data.node === null && task.promptId) {
-          void finalize(task);
-        } else {
-          touch(task, { status: "running", stage: "正在执行节点", currentNode: data.node ?? null });
-        }
+        if (data.node === null) void finalize(task);
+        else touch(task, { status: "running", stage: "正在执行节点", currentNode: data.node ?? null });
       } else if (event.type === "progress") {
-        const value = Number(data.value ?? 0);
-        const max = Number(data.max ?? 0);
-        touch(task, {
-          status: "running",
-          stage: "正在采样",
-          progress: {
-            value,
-            max,
-            percent: max > 0 ? Math.max(0, Math.min(100, Math.round((value / max) * 100))) : null
-          }
-        });
+        const value = Number(data.value || 0);
+        const max = Number(data.max || 0);
+        touch(task, { status: "running", stage: "正在执行工作流", progress: { value, max, percent: max > 0 ? Math.round(value / max * 100) : null } });
       } else if (event.type === "execution_success") {
         void finalize(task);
-      } else if (event.type === "execution_error" || event.type === "execution_interrupted") {
+      } else if (["execution_error", "execution_interrupted"].includes(event.type)) {
         touch(task, {
           status: event.type === "execution_interrupted" ? "cancelled" : "failed",
           stage: event.type === "execution_interrupted" ? "已取消" : "执行失败",
-          error: data.exception_message ?? data.error ?? null
+          error: data.exception_message || data.error || null
         });
+        if (task.poller) clearInterval(task.poller);
+        task.poller = null;
+        task.socket?.close();
+        scheduleConnection(task.connection.id);
       }
     });
-    socket.on("error", (error) => {
-      if (task.status === "connecting") touch(task, { stage: "WebSocket 不可用，已切换轮询", error: null });
-      ctx.logger?.warn?.(`[${PLUGIN_ID}] ComfyUI WebSocket: ${publicError(error)}`);
-    });
+    socket.on("error", (error) => ctx.logger?.warn?.(`[${PLUGIN_ID}] websocket: ${publicError(error)}`));
     socket.on("close", () => sockets.delete(socket));
   }
 
   async function connectSocket(task) {
-    const socket = new WebSocket(websocketUrl(task.connection.baseUrl, task.clientId), {
-      rejectUnauthorized: !task.connection.allowSelfSigned
-    });
+    if (task.socket && task.socket.readyState <= 1) return;
+    const socket = new WebSocket(websocketUrl(task.connection.baseUrl, task.clientId), { rejectUnauthorized: !task.connection.allowSelfSigned });
     task.socket = socket;
     sockets.add(socket);
     watchSocket(task, socket);
     await new Promise((resolveOpen, rejectOpen) => {
       const timer = setTimeout(() => rejectOpen(new Error("WebSocket 连接超时")), 5000);
-      socket.once("open", () => {
-        clearTimeout(timer);
-        resolveOpen();
-      });
-      socket.once("error", (error) => {
-        clearTimeout(timer);
-        rejectOpen(error);
-      });
+      socket.once("open", () => { clearTimeout(timer); resolveOpen(); });
+      socket.once("error", (error) => { clearTimeout(timer); rejectOpen(error); });
     });
   }
 
   function startHistoryFallback(task) {
+    if (task.poller) return;
     task.poller = setInterval(async () => {
-      if (!task.promptId || ["completed", "failed", "cancelled"].includes(task.status)) return;
+      if (!task.promptId || TERMINAL.has(task.status)) return;
       try {
         const history = await comfyJson(task.connection, `/history/${encodeURIComponent(task.promptId)}`);
         if (history?.[task.promptId] || history?.outputs) await finalize(task);
-      } catch {
-        // Empty history and transient connection failures are expected while a job runs.
+      } catch { /* transient while running */ }
+    }, 2500);
+  }
+
+  async function submitTask(task) {
+    let compatibility;
+    try { compatibility = await inspectCompatibility(task.workflowSnapshot, task.fieldSnapshot, task.connection, true); }
+    catch (error) {
+      touch(task, { status: "waiting", stage: "服务器离线，等待恢复", error: publicError(error) });
+      return;
+    }
+    if (!compatibility.ok) {
+      touch(task, { status: "failed", stage: "工作流与服务器不兼容", error: "请重新运行兼容性检测并修复缺失节点、模型或端口" });
+      scheduleConnection(task.connection.id);
+      return;
+    }
+    let prompt;
+    try {
+      task.fieldSnapshot = compatibility.fields;
+      prompt = applyWorkflowValues(task.workflowSnapshot, compatibility.fields.filter((field) => field.visible), task.values);
+    }
+    catch (error) {
+      touch(task, { status: "failed", stage: "参数校验失败", error: publicError(error) });
+      scheduleConnection(task.connection.id);
+      return;
+    }
+    await connectSocket(task).catch((error) => touch(task, { stage: `实时通道不可用，使用轮询：${publicError(error)}` }));
+    try {
+      const answer = await comfyJson(task.connection, "/prompt", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompt, client_id: task.clientId })
+      });
+      if (!answer.prompt_id) throw new Error("ComfyUI 未返回 prompt_id");
+      touch(task, { promptId: answer.prompt_id, status: "remote_queued", stage: "已提交到 ComfyUI 队列", error: null });
+      startHistoryFallback(task);
+    } catch (error) {
+      touch(task, { status: "failed", stage: "提交状态不确定，为避免重复生成已停止", error: publicError(error) });
+      task.socket?.close();
+      scheduleConnection(task.connection.id);
+    }
+  }
+
+  async function dispatchConnection(connectionId) {
+    if (disposed || dispatching.has(connectionId)) return;
+    dispatching.add(connectionId);
+    try {
+      let connection;
+      try { connection = connectionCatalog.get(connectionId); } catch { return; }
+      const activeCount = [...tasks.values()].filter((task) => task.connection.id === connectionId && ACTIVE.has(task.status)).length;
+      const capacity = Math.max(0, connection.maxConcurrency - activeCount);
+      const waiting = [...tasks.values()]
+        .filter((task) => task.connection.id === connectionId && task.status === "waiting")
+        .sort((a, b) => a.createdAt - b.createdAt)
+        .slice(0, capacity);
+      for (const task of waiting) {
+        touch(task, { status: "submitting", stage: "正在校验服务器并准备提交", error: null });
+        void submitTask(task);
       }
-    }, 2000);
+    } finally { dispatching.delete(connectionId); }
   }
 
   async function createTask(payload) {
-    const mode = ["t2v", "i2v", "keyframe"].includes(payload.mode) ? payload.mode : "t2v";
-    const id = randomUUID();
-    await workflowReady;
-    const values = payload.values ?? {};
-    const connection = connectionCatalog.get(payload.connectionPresetId || values.connectionPresetId);
-    const normalizedKeyframes = mode === "keyframe" ? normalizeKeyframes(values) : [];
-    const workflowPresetId = String(payload.workflowPresetId || values.workflowPresetId || DEFAULT_WORKFLOW_PRESET_ID).trim();
-    const { entry } = workflowRegistry.get(workflowPresetId, mode, mode === "keyframe" ? normalizedKeyframes.length : null);
-    const configured = configureWorkflow({
-      entry,
-      mode,
-      values: mode === "keyframe" ? { ...values, keyframes: normalizedKeyframes } : values,
-      taskId: id
-    });
-    const destination = outputDirectory(values);
+    await Promise.all([historyReady, workflowReady, connectionReady]);
+    const workflow = workflowRegistry.get(payload?.workflowId);
+    const connection = connectionCatalog.get(payload?.connectionPresetId);
+    const values = payload?.values && typeof payload.values === "object" ? payload.values : {};
+    let compatibility = null;
+    try { compatibility = await inspectCompatibility(workflow.workflow, workflow.fields, connection, true); }
+    catch { /* offline tasks stay local */ }
+    if (compatibility && !compatibility.ok) throw new Error("工作流与所选服务器不兼容，请先查看缺失节点、模型或端口报告");
+    applyWorkflowValues(workflow.workflow, (compatibility?.fields || workflow.fields).filter((field) => field.visible), values);
     const task = {
-      id,
+      id: randomUUID(),
       promptId: null,
       clientId: randomUUID(),
-      mode,
-      prompt: configured.prompt,
+      workflowId: workflow.id,
+      workflowName: workflow.name,
+      workflowHash: workflow.hash,
+      workflowSnapshot: clone(workflow.workflow),
+      fieldSnapshot: clone(compatibility?.fields || workflow.fields),
+      values: clone(values),
       connection,
-      workflowPresetId,
-      resolutionPreset: configured.resolution.id,
-      keyframes: configured.keyframes,
-      frameCount: configured.frameCount,
-      outputDirectory: resolve(destination),
-      outputPath: null,
-      status: "connecting",
-      stage: "正在连接 ComfyUI",
+      primaryOutputNodeId: workflow.primaryOutputNodeId,
+      outputDirectory: outputDirectory(payload?.outputDirectory),
+      outputs: [],
+      status: "waiting",
+      stage: compatibility ? "等待本地调度槽" : "服务器离线，等待恢复",
       currentNode: null,
       progress: { value: 0, max: 0, percent: null },
       queueRemaining: null,
       error: null,
+      warning: connection.maxConcurrency > 1 ? "标准单 GPU ComfyUI 可能仍会串行执行远端队列" : null,
+      legacy: false,
       createdAt: Date.now(),
       updatedAt: Date.now(),
       socket: null,
       poller: null,
-      finalizing: false,
-      onChange: scheduleHistory
+      finalizing: false
     };
-    tasks.set(id, task);
+    tasks.set(task.id, task);
     scheduleHistory();
-    try {
-      await connectSocket(task).catch((error) => {
-        touch(task, { stage: `实时通道不可用，使用轮询：${publicError(error)}` });
-      });
-      touch(task, { status: "queued", stage: "正在提交工作流" });
-      const answer = await comfyJson(task.connection, "/prompt", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ prompt: configured.workflow, client_id: task.clientId })
-      });
-      if (!answer.prompt_id) throw new Error("ComfyUI 未返回 prompt_id");
-      touch(task, { promptId: answer.prompt_id, stage: "已进入 ComfyUI 队列" });
-      startHistoryFallback(task);
-      return task;
-    } catch (error) {
-      touch(task, { status: "failed", stage: "提交失败", error: publicError(error) });
-      task.socket?.close();
-      throw error;
-    }
-  }
-
-  async function optimize(payload) {
-    await workflowReady;
-    const sessionId = String(payload.sessionId ?? "");
-    const provider = String(payload.provider ?? "");
-    const model = String(payload.model ?? "");
-    const prompt = String(payload.prompt ?? "").trim();
-    const isImageToVideo = payload.mode === "i2v";
-    const isKeyframe = payload.mode === "keyframe";
-    const mode = isKeyframe ? "关键帧生成视频" : isImageToVideo ? "图生视频" : "文生视频";
-    const duration = finiteNumber(payload.duration, isImageToVideo || isKeyframe ? 10 : 5, 1, 60);
-    const resolution = RESOLUTION_PRESETS[payload.resolutionPreset] || RESOLUTION_PRESETS.balanced;
-    const aspectRatio = `${resolution.width}×${resolution.height}，9:16 手机竖屏`;
-    const hasImage = Boolean(String(payload.image ?? "").trim());
-    const keyframes = isKeyframe ? normalizeKeyframes({ keyframes: payload.keyframes, duration }) : [];
-    const workflowPresetId = String(payload.workflowPresetId || DEFAULT_WORKFLOW_PRESET_ID).trim();
-    workflowRegistry.get(workflowPresetId, payload.mode, isKeyframe ? keyframes.length : null);
-    if (!sessionId || !ctx.agents.get(sessionId)) throw new Error("当前会话不可用，请先打开一个 Harness 会话");
-    if (!provider || !model) throw new Error("当前会话尚未选择模型");
-    if (!prompt) throw new Error("请输入需要优化的提示词");
-    if (isImageToVideo && !hasImage) throw new Error("图生视频必须先上传参考图，再进行 AI 优化");
-    const timeline = keyframes.map((item) => `@${item.ref}=${item.timeSeconds.toFixed(3)}秒（第${item.frameIndex}帧）`).join(" → ");
-    const ruleLines = DEFAULT_VIDEO_RULE_IDS.map((id) => `${id}: ${DEFAULT_VIDEO_RULES[id]}`);
-
-    const system = [
-      "你是 MiniMax H3 视频提示词导演和需求完整性审查器。",
-      `任务类型：${mode}；目标时长：${duration} 秒；画幅：${aspectRatio}。`,
-      "先判断原始描述是否存在会显著改变成片结果、且无法用保守默认值解决的歧义。",
-      "只有缺少主体、核心事件/动作、关键时序，或存在互相冲突的意图时才澄清；不要为了偏好细节过度提问。",
-      "需要澄清时最多提出 3 个能改变决策的问题，当前步骤必须停止，不得先猜测并生成提示词。",
-      "信息充分时，输出可直接交给 MiniMax H3 的简洁中文提示词；保留用户明确的人物、数量、身份、动作、场景和事件。",
-      "提示词以清晰为目标，不为长度堆砌形容词；除非原始需求本身复杂，最终提示词控制在 1800 个中文字符以内。",
-      "文生视频按主体与外观、环境、主体动作、环境运动、镜头景别与运动、光线风格、分段时序组织。",
-      "图生视频把参考图作为第 0 秒与静态视觉事实；不得虚构身份、服装、颜色或隐藏侧几何。",
-      isKeyframe ? `关键帧时间线：${timeline}。每个 @K 引用只代表该时刻图片中的静态可见事实；只描述相邻引用之间的连续过渡，不得用文字重写图片事实。` : "",
-      "单镜头优先只安排一个主要运动载体；动作按建立、执行、停稳分配到目标时长。",
-      "下列六项是默认拍摄规则。用户没有明确提出相反要求时必须整合进提示词；如用户明确冲突，保留用户要求，并在 overriddenRules 中用一句话说明原因：",
-      ...ruleLines,
-      "ready 输出必须让六个规则 ID 全部且仅出现于 appliedRules 或 overriddenRules；不得遗漏，也不得同时出现在两处。",
-      "只返回一行合法 JSON，不要 Markdown。两种唯一格式：",
-      '{"decision":"clarify","reason":"为什么必须确认","questions":["问题1","问题2"]}',
-      '{"decision":"ready","summary":"做了哪些关键补全","prompt":"完整优化提示词","appliedRules":["smooth_rotation","portrait_9_16","handheld_motion","fixed_body_direction","fixed_gaze","natural_blink"],"overriddenRules":{}}'
-    ].filter(Boolean).join("\n");
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.max(config.requestTimeoutMs, 120000));
-    try {
-      const run = async (retryNote = "") => {
-        const input = [prompt, isKeyframe ? `关键帧引用时间线：${timeline}` : "", retryNote].filter(Boolean).join("\n\n");
-        const options = Object.freeze({
-          provider,
-          model,
-          messages: Object.freeze([userMessage(input)]),
-          system,
-          maxTokens: 2200,
-          sessionId,
-          purpose: "comfy-video-prompt-optimization",
-          signal: controller.signal
-        });
-        const fragments = [];
-        let fallbackText = "";
-        let finish = null;
-        for await (const chunk of ctx.llm.stream(options)) {
-          if (chunk.type === "text-delta") fragments.push(chunk.text);
-          if (chunk.type === "block-end" && chunk.block?.type === "text") fallbackText += chunk.block.text;
-          if (chunk.type === "finish") finish = chunk.reason;
-        }
-        const failed = finishError(finish);
-        if (failed) throw failed;
-        const text = (fragments.length > 0 ? fragments.join("") : fallbackText).trim();
-        if (!text) throw new Error("模型没有返回优化决策");
-        return parseOptimizationDecision(text);
-      };
-      let decision;
-      try {
-        decision = await run();
-      } catch (error) {
-        if (error?.code !== "DEFAULT_RULES_INCOMPLETE") throw error;
-        decision = await run(`上次输出遗漏规则 ID：${error.missingRules.join(", ")}。请重新返回完整 JSON。`);
-      }
-      return { ...decision, provider, model, workflowPresetId, timeline: keyframes };
-    } finally {
-      clearTimeout(timer);
-    }
+    scheduleConnection(connection.id);
+    return taskView(task);
   }
 
   async function cancelTask(task) {
-    if (["completed", "failed", "cancelled"].includes(task.status)) return;
-    if (task.status === "queued" && task.promptId) {
-      await comfy(task.connection, "/queue", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ delete: [task.promptId] })
-      });
+    if (TERMINAL.has(task.status)) return;
+    if (task.status === "waiting" || task.status === "submitting" && !task.promptId) {
+      touch(task, { status: "cancelled", stage: "已从本地队列取消" });
+    } else if (task.status === "remote_queued" && task.promptId) {
+      await comfy(task.connection, "/queue", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ delete: [task.promptId] }) });
+      touch(task, { status: "cancelled", stage: "已从 ComfyUI 队列取消" });
     } else {
       await comfy(task.connection, "/interrupt", { method: "POST" });
+      touch(task, { status: "cancelled", stage: "已中断服务器当前任务" });
     }
-    touch(task, { status: "cancelled", stage: "已取消" });
     if (task.poller) clearInterval(task.poller);
+    task.poller = null;
     task.socket?.close();
+    scheduleConnection(task.connection.id);
   }
 
-  async function upload(req, connection) {
-    const maxBytes = Math.round(config.maxUploadMb * 1024 * 1024);
-    const bytes = await readBody(req, maxBytes);
-    if (bytes.length === 0) throw new Error("上传文件为空");
-    const rawName = req.headers["x-file-name"];
-    const filename = decodeURIComponent(Array.isArray(rawName) ? rawName[0] : rawName || "input.png")
-      .split(/[\\/]/)
-      .pop();
-    const mime = String(req.headers["content-type"] ?? "application/octet-stream");
-    const form = new FormData();
-    form.append("image", new Blob([bytes], { type: mime }), filename);
-    form.append("type", "input");
-    form.append("overwrite", "false");
-    const response = await comfy(connection, "/upload/image", { method: "POST", body: form });
-    return response.json();
-  }
-
-  async function inspectConnection(connection) {
-    const [stats, objectInfo] = await Promise.all([
-      comfyJson(connection, "/system_stats"),
-      comfyJson(connection, "/object_info")
-    ]);
-    const required = [
-      "SaveVideo", "LoadImage", "VAELoader", "VAEDecodeAudio",
-      "KSamplerSelect", "BasicScheduler", "SamplerCustomAdvanced", "BasicGuider",
-      "UNETLoader", "CLIPLoader", "RandomNoise", "CreateVideo",
-      "MiniMaxH3ImageToVideo", "MiniMaxH3AddImageGuideBackport", "Video Slice", "ComfyMathExpression", "PrimitiveFloat"
-    ];
-    const missingNodes = required.filter((name) => !objectInfo?.[name]);
-    return {
-      ok: missingNodes.length === 0,
-      connection: publicConnection(connection),
-      missingNodes,
-      stats,
-      historyFile: config.historyFile,
-      workflowDirectory: config.workflowDirectory,
-      workflows: workflowRegistry.list()
-    };
-  }
-
-  async function serveVideo(req, res, task) {
-    if (!task?.outputPath) return json(res, 404, { error: "视频尚未生成" });
+  async function serveVideo(req, res, task, outputIndex) {
+    const output = task?.outputs?.[outputIndex];
+    if (!output?.outputPath) return json(res, 404, { error: "视频不存在" });
     let info;
-    try {
-      info = await stat(task.outputPath);
-    } catch {
-      return json(res, 404, { error: "输出文件不存在" });
-    }
-    const type = contentType(task.outputPath);
+    try { info = await stat(output.outputPath); } catch { return json(res, 404, { error: "视频文件不存在" }); }
+    const type = contentType(output.outputPath);
     const range = req.headers.range;
     if (!range) {
-      res.writeHead(200, {
-        "content-type": type,
-        "content-length": info.size,
-        "accept-ranges": "bytes",
-        "cache-control": "private, no-cache"
-      });
+      res.writeHead(200, { "content-type": type, "content-length": info.size, "accept-ranges": "bytes", "cache-control": "private, no-cache" });
       if (req.method === "HEAD") return res.end();
-      return createReadStream(task.outputPath).pipe(res);
+      return createReadStream(output.outputPath).pipe(res);
     }
     const match = /^bytes=(\d*)-(\d*)$/.exec(range);
-    if (!match) {
-      res.writeHead(416, { "content-range": `bytes */${info.size}` });
-      return res.end();
-    }
+    if (!match) { res.writeHead(416, { "content-range": `bytes */${info.size}` }); return res.end(); }
     const start = match[1] ? Number(match[1]) : 0;
     const end = match[2] ? Math.min(Number(match[2]), info.size - 1) : info.size - 1;
-    if (start > end || start >= info.size) {
-      res.writeHead(416, { "content-range": `bytes */${info.size}` });
-      return res.end();
-    }
-    res.writeHead(206, {
-      "content-type": type,
-      "content-length": end - start + 1,
-      "content-range": `bytes ${start}-${end}/${info.size}`,
-      "accept-ranges": "bytes",
-      "cache-control": "private, no-cache"
-    });
+    if (start > end || start >= info.size) { res.writeHead(416, { "content-range": `bytes */${info.size}` }); return res.end(); }
+    res.writeHead(206, { "content-type": type, "content-length": end - start + 1, "content-range": `bytes ${start}-${end}/${info.size}`, "accept-ranges": "bytes", "cache-control": "private, no-cache" });
     if (req.method === "HEAD") return res.end();
-    createReadStream(task.outputPath, { start, end }).pipe(res);
+    createReadStream(output.outputPath, { start, end }).pipe(res);
   }
 
+  retryTimer = setInterval(() => {
+    const ids = new Set([...tasks.values()].filter((task) => task.status === "waiting").map((task) => task.connection.id));
+    for (const id of ids) void dispatchConnection(id);
+  }, 10000);
+
   async function handler(req, res) {
-    const url = new URL(req.url ?? "/", "http://dsh.local");
+    const url = new URL(req.url || "/", "http://dsh.local");
     const path = url.pathname.slice(API_PREFIX.length) || "/";
     try {
-      await historyReady;
-      await workflowReady;
-      if (req.method === "GET" && path === "/health") {
-        const connection = connectionCatalog.get(url.searchParams.get("connectionPresetId"));
-        return json(res, 200, await inspectConnection(connection));
+      await Promise.all([historyReady, workflowReady, connectionReady]);
+
+      if (req.method === "GET" && path === "/connections") return json(res, 200, connectionCatalog.list());
+      if (req.method === "POST" && path === "/connections") return json(res, 200, await connectionCatalog.save(await readJson(req)));
+      const connectionHealthMatch = /^\/connections\/([^/]+)\/health$/.exec(path);
+      if (req.method === "GET" && connectionHealthMatch) {
+        return json(res, 200, await inspectConnection(connectionCatalog.get(decodeURIComponent(connectionHealthMatch[1])), url.searchParams.get("deep") === "1"));
       }
-      if (req.method === "GET" && path === "/connections") {
-        return json(res, 200, connectionCatalog.list());
-      }
-      if (req.method === "POST" && path === "/connections/test") {
-        const connection = connectionCatalog.preview(await readJson(req));
-        try {
-          return json(res, 200, await inspectConnection(connection));
-        } finally {
-          await connection.dispatcher?.close?.();
-        }
-      }
-      if (req.method === "POST" && path === "/connections") {
-        const preset = await connectionCatalog.save(await readJson(req));
-        return json(res, 200, { preset, catalog: connectionCatalog.list() });
+      const connectionQueueMatch = /^\/connections\/([^/]+)\/queue$/.exec(path);
+      if (req.method === "PATCH" && connectionQueueMatch) {
+        const id = decodeURIComponent(connectionQueueMatch[1]);
+        const result = await connectionCatalog.updateQueue(id, (await readJson(req)).maxConcurrency);
+        scheduleConnection(id);
+        return json(res, 200, result);
       }
       const connectionMatch = /^\/connections\/([^/]+)$/.exec(path);
+      if (req.method === "PATCH" && connectionMatch) return json(res, 200, await connectionCatalog.save({ ...(await readJson(req)), id: decodeURIComponent(connectionMatch[1]) }));
       if (req.method === "DELETE" && connectionMatch) {
-        return json(res, 200, await connectionCatalog.remove(decodeURIComponent(connectionMatch[1])));
+        const id = decodeURIComponent(connectionMatch[1]);
+        if ([...tasks.values()].some((task) => task.connection.id === id && !TERMINAL.has(task.status))) throw new Error("该服务器仍有等待或运行任务，不能删除");
+        return json(res, 200, await connectionCatalog.remove(id));
       }
-      if (req.method === "POST" && path === "/upload") {
+
+      if (req.method === "POST" && path === "/workflows/inspect") {
+        const workflow = parseApiWorkflow(await readBody(req, Math.round(config.maxWorkflowMb * 1024 * 1024)));
+        const connectionId = url.searchParams.get("connectionPresetId");
+        const analysis = connectionId
+          ? await inspectCompatibility(workflow, null, connectionCatalog.get(connectionId), true)
+          : analyzeWorkflow(workflow);
+        return json(res, 200, { analysis });
+      }
+      if (req.method === "GET" && path === "/workflows") return json(res, 200, workflowRegistry.list());
+      if (req.method === "POST" && path === "/workflows") return json(res, 201, await workflowRegistry.save(await readJson(req)));
+      const compatibilityMatch = /^\/workflows\/([^/]+)\/compatibility$/.exec(path);
+      if (req.method === "GET" && compatibilityMatch) {
+        const workflow = workflowRegistry.get(decodeURIComponent(compatibilityMatch[1]));
         const connection = connectionCatalog.get(url.searchParams.get("connectionPresetId"));
-        return json(res, 200, await upload(req, connection));
+        return json(res, 200, await inspectCompatibility(workflow.workflow, workflow.fields, connection, url.searchParams.get("force") === "1"));
       }
-      if (req.method === "POST" && path === "/optimize") {
-        return json(res, 200, await optimize(await readJson(req)));
+      const workflowMatch = /^\/workflows\/([^/]+)$/.exec(path);
+      if (req.method === "GET" && workflowMatch) return json(res, 200, workflowRegistry.get(decodeURIComponent(workflowMatch[1])));
+      if (req.method === "PATCH" && workflowMatch) return json(res, 200, await workflowRegistry.update(decodeURIComponent(workflowMatch[1]), await readJson(req)));
+      if (req.method === "DELETE" && workflowMatch) return json(res, 200, await workflowRegistry.remove(decodeURIComponent(workflowMatch[1])));
+
+      if (req.method === "POST" && path === "/upload") {
+        return json(res, 200, await upload(req, connectionCatalog.get(url.searchParams.get("connectionPresetId"))));
       }
-      if (req.method === "POST" && path === "/generate") {
-        const task = await createTask(await readJson(req));
-        return json(res, 202, taskView(task));
-      }
-      if (req.method === "GET" && path === "/workflows") {
-        return json(res, 200, workflowRegistry.list());
-      }
-      if (req.method === "POST" && path === "/workflows/refresh") {
-        workflowReady = workflowRegistry.refresh();
-        return json(res, 200, await workflowReady);
-      }
-      if (req.method === "GET" && path === "/templates") {
-        return json(res, 200, [...promptTemplates.values()].sort((a, b) => b.updatedAt - a.updatedAt));
-      }
-      if (req.method === "POST" && path === "/templates") {
-        return json(res, 200, await savePromptTemplate(await readJson(req)));
-      }
-      const templateMatch = /^\/templates\/([^/]+)$/.exec(path);
-      if (req.method === "DELETE" && templateMatch) {
-        const removed = promptTemplates.delete(decodeURIComponent(templateMatch[1]));
-        if (!removed) return json(res, 404, { error: "模板不存在" });
-        await persistHistory();
-        return json(res, 200, { removed: 1 });
-      }
-      if (req.method === "GET" && path === "/tasks") {
-        return json(res, 200, [...tasks.values()].sort((a, b) => b.createdAt - a.createdAt).map(taskView));
-      }
+      if (req.method === "GET" && path === "/tasks") return json(res, 200, [...tasks.values()].sort((a, b) => b.createdAt - a.createdAt).map(taskView));
+      if (req.method === "POST" && path === "/tasks") return json(res, 202, await createTask(await readJson(req)));
       if (req.method === "DELETE" && path === "/tasks") {
         let removed = 0;
-        for (const [id, task] of tasks) {
-          if (!["completed", "failed", "cancelled"].includes(task.status)) continue;
-          tasks.delete(id);
-          removed += 1;
-        }
+        for (const [id, task] of tasks) if (TERMINAL.has(task.status)) { tasks.delete(id); removed += 1; }
         await persistHistory();
         return json(res, 200, { removed });
+      }
+      const taskCancelMatch = /^\/tasks\/([^/]+)\/cancel$/.exec(path);
+      if (req.method === "POST" && taskCancelMatch) {
+        const task = tasks.get(decodeURIComponent(taskCancelMatch[1]));
+        if (!task) return json(res, 404, { error: "任务不存在" });
+        await cancelTask(task);
+        return json(res, 200, taskView(task));
       }
       const taskMatch = /^\/tasks\/([^/]+)$/.exec(path);
       if (req.method === "GET" && taskMatch) {
         const task = tasks.get(decodeURIComponent(taskMatch[1]));
         return task ? json(res, 200, taskView(task)) : json(res, 404, { error: "任务不存在" });
       }
-      const cancelMatch = /^\/tasks\/([^/]+)\/cancel$/.exec(path);
-      if (req.method === "POST" && cancelMatch) {
-        const task = tasks.get(decodeURIComponent(cancelMatch[1]));
-        if (!task) return json(res, 404, { error: "任务不存在" });
-        await cancelTask(task);
-        return json(res, 200, taskView(task));
-      }
-      const videoMatch = /^\/video\/([^/]+)$/.exec(path);
+      const videoMatch = /^\/video\/([^/]+)\/(\d+)$/.exec(path);
       if ((req.method === "GET" || req.method === "HEAD") && videoMatch) {
-        return serveVideo(req, res, tasks.get(decodeURIComponent(videoMatch[1])));
+        return serveVideo(req, res, tasks.get(decodeURIComponent(videoMatch[1])), Number(videoMatch[2]));
       }
       return json(res, 404, { error: "接口不存在" });
     } catch (error) {
@@ -1091,28 +858,17 @@ export function apply(ctx, rawConfig = {}) {
     }
   }
 
-  ctx.effect(() => ctx.webServer.register({
-    kind: "prefix",
-    path: API_PREFIX,
-    handler
-  }), `${PLUGIN_ID}: ComfyUI studio API`);
-
+  ctx.effect(() => ctx.webServer.register({ kind: "prefix", path: API_PREFIX, handler }), `${PLUGIN_ID}: dynamic ComfyUI workflow API`);
   ctx.effect(() => async () => {
     disposed = true;
+    if (retryTimer) clearInterval(retryTimer);
     if (historyTimer) clearTimeout(historyTimer);
     for (const task of tasks.values()) if (task.poller) clearInterval(task.poller);
     for (const socket of sockets) socket.close();
     sockets.clear();
-    const ephemeralDispatchers = [...tasks.values()]
-      .map((task) => task.connection)
-      .filter((connection) => connection?.ephemeral && connection.dispatcher)
-      .map((connection) => connection.dispatcher.close());
-    await Promise.all(ephemeralDispatchers);
+    const ephemeralDispatchers = new Set([...tasks.values()].filter((task) => task.connection?.ephemeral && task.connection.dispatcher).map((task) => task.connection.dispatcher));
+    await Promise.all([...ephemeralDispatchers].map((dispatcher) => dispatcher.close()));
     await connectionCatalog.close();
     await persistHistory().catch((error) => ctx.logger?.warn?.(`[${PLUGIN_ID}] final history write failed: ${publicError(error)}`));
-  }, `${PLUGIN_ID}: stop background task monitors`);
-
-  void workflowReady.catch((error) => {
-    if (!disposed) ctx.logger?.error?.(`[${PLUGIN_ID}] workflow preset load failed: ${publicError(error)}`);
-  });
+  }, `${PLUGIN_ID}: stop schedulers and monitors`);
 }

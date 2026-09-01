@@ -6,112 +6,63 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 const patch = await readFile(join(root, "cordis.patch.yml"), "utf8");
 const host = await readFile(join(root, "lib", "index.js"), "utf8");
+const workflows = await readFile(join(root, "lib", "workflow-presets.js"), "utf8");
 const client = await readFile(join(root, "lib", "client.js"), "utf8");
 
-for (const file of [
-  "assets/workflows/video_minimax_h3_i2v.json",
-  "assets/workflows/video_minimax_h3_t2v.json",
-  "assets/workflows/video_minimax_h3_keyframe_1.json",
-  "assets/workflows/video_minimax_h3_keyframe_2.json",
-  "assets/workflows/video_minimax_h3_keyframe_3.json",
-  "assets/workflows/video_minimax_h3_t2v.workflow.json",
-  "assets/workflows/video_minimax_h3_i2v.workflow.json",
-  "assets/workflows/video_minimax_h3_keyframe_1.workflow.json",
-  "assets/workflows/video_minimax_h3_keyframe_2.workflow.json",
-  "assets/workflows/video_minimax_h3_keyframe_3.workflow.json",
-  "assets/workflows/minimax-h3-default.preset.json",
-  "lib/index.js",
-  "lib/workflow-presets.js",
-  "lib/client.js",
-  "README.md",
-  "README.en.md"
-]) await access(join(root, file));
+for (const file of ["lib/index.js", "lib/workflow-presets.js", "lib/client.js", "README.md", "README.en.md"]) await access(join(root, file));
+if (pkg.name !== "dsh-comfy-video-studio" || pkg.version !== "0.8.0") throw new Error("package identity/version mismatch");
+if (pkg.files?.includes("assets/workflows")) throw new Error("fixed workflow assets must not ship in the dynamic studio");
+if (pkg.scripts?.prepack !== "npm run build && npm run check") throw new Error("prepack must build and validate");
+if (!patch.includes("maxWorkflowMb: 5")) throw new Error("bundle patch must configure workflow upload limit");
 
-if (pkg.name !== "dsh-comfy-video-studio") throw new Error("package name mismatch");
-if (pkg.dsh?.bundle?.patch !== "./cordis.patch.yml") throw new Error("missing dsh bundle patch");
-if (pkg.publishConfig?.access !== "public") throw new Error("npm package must publish publicly");
-if (pkg.publishConfig?.registry !== "https://registry.npmjs.org/") throw new Error("npm package must publish to the official registry");
-if (!pkg.files?.includes("lib")) throw new Error("npm package must include prebuilt lib output");
-if (pkg.scripts?.prepack !== "npm run build && npm run check") throw new Error("prepack must build and validate the package");
-for (const dependency of [
-  "@deepseek-ai/dsh-client-runtime",
-  "@deepseek-ai/dsh-client-connection",
-  "@deepseek-ai/dsh-client-ui-layout",
-  "@deepseek-ai/dsh-client-ui-sidebar"
-]) {
-  if (!pkg.dsh?.client?.inject?.includes(dependency)) throw new Error(`missing client dependency: ${dependency}`);
-}
-if (!patch.includes("name: dsh-comfy-video-studio")) throw new Error("bundle patch does not mount the plugin");
 for (const marker of [
-  "ctx.webServer.register",
-  "ctx.llm.stream",
-  'path: API_PREFIX',
-  'kind: "prefix"',
-  "Readable.fromWeb",
-  "content-range",
-  "historyFile",
-  "persistHistory",
-  'req.method === "DELETE" && path === "/tasks"',
-  'path === "/templates"',
+  'path === "/workflows/inspect"',
   'path === "/workflows"',
-  'path === "/workflows/refresh"',
-  'path === "/connections"',
-  'path === "/connections/test"',
-  'connectionPresetId',
-  'createConnectionCatalog',
-  'connectionsFile',
-  'createWorkflowRegistry',
-  'appliedRules'
+  'path === "/tasks"',
+  'connectionQueueMatch',
+  'inspectCompatibility',
+  'dispatchConnection',
+  'status: "waiting"',
+  'status: "remote_queued"',
+  'workflowSnapshot',
+  'primaryOutputNodeId',
+  'videoDescriptors',
+  'Readable.fromWeb',
+  'content-range'
 ]) if (!host.includes(marker)) throw new Error(`host feature missing: ${marker}`);
+
 for (const marker of [
-  'id: "dsh-comfy-video-studio"',
+  "parseApiWorkflow",
+  "analyzeWorkflow",
+  "applyWorkflowValues",
+  "createWorkflowRegistry",
+  "TRUSTED_NODE_HINTS",
+  "missingModels",
+  "connectionErrors",
+  "suggestedPrimaryOutputNodeId",
+  "video_upload",
+  "image_upload"
+]) if (!workflows.includes(marker)) throw new Error(`workflow feature missing: ${marker}`);
+
+for (const marker of [
+  'id: "comfy-video-studio"',
   'sidebar.footer.action',
   'shell.overlay',
-  'connection.api.sessions.models',
-  'const inject = ["slots", "connection", "sessions"]',
-  'sessions.binding',
-  'COMFY_VIDEO_PROMPT',
-  '等待提示词优化',
-  '展开查看',
-  '暂无自定义模板',
-  '保存为新模板',
-  '更新所选',
-  '关键帧',
-  '工作流预设',
-  'ComfyUI 连接',
-  '管理 ComfyUI 连接',
-  '保存为新连接',
-  '手动输入预设 ID',
-  '固定 24 FPS',
-  'data-ds-dark-theme',
-  '清空已结束',
-  'className: "cvs-shell"',
-  'prefers-reduced-motion'
+  '工作流库',
+  '导入工作流',
+  '任务中心',
+  '服务器管理',
+  '编辑工作流页面',
+  'CompatibilityReport',
+  'FieldEditor',
+  'DynamicField',
+  '并发槽只限制插件提交数',
+  'const inject = ["slots"]',
+  'data-plugin-css'
 ]) if (!client.includes(marker)) throw new Error(`client feature missing: ${marker}`);
-if (client.includes("remote.sessions.models")) throw new Error("client must query session models through connection.api.sessions");
-if (/__[A-Z0-9_]+__/.test(client)) throw new Error("unresolved client placeholder");
-
-for (const mode of ["i2v", "t2v"]) {
-  const workflow = JSON.parse(await readFile(join(root, "assets", "workflows", `video_minimax_h3_${mode}.json`), "utf8"));
-  for (const node of ["92", "121", "105:9", "105:15", "105:17", "105:91", "105:104", "105:111"]) {
-    if (!workflow[node]) throw new Error(`${mode} workflow is missing node ${node}`);
-  }
-  if (mode === "i2v" && !workflow["114"]) throw new Error("i2v workflow is missing LoadImage node 114");
+if (/__[A-Z0-9_]+__/.test(client)) throw new Error("client bundle contains unresolved placeholders");
+for (const removed of ["ctx.llm.stream", 'path === "/optimize"', 'path === "/templates"', "minimax-h3-default", "person_replace"]) {
+  if (host.includes(removed) || client.includes(removed)) throw new Error(`removed fixed-template feature still present: ${removed}`);
 }
 
-for (const count of [1, 2, 3]) {
-  const keyframe = JSON.parse(await readFile(join(root, "assets", "workflows", `video_minimax_h3_keyframe_${count}.json`), "utf8"));
-  for (const node of ["2", "9", "11", "12", "13", "14", "15", "19", "21", "27", "28"]) {
-    if (!keyframe[node]) throw new Error(`${count}-keyframe workflow is missing node ${node}`);
-  }
-  for (let index = 0; index < count; index += 1) {
-    if (keyframe[String(22 + index)]?.class_type !== "LoadImage") throw new Error(`${count}-keyframe workflow image chain is invalid`);
-    if (keyframe[String(30 + index)]?.class_type !== "MiniMaxH3AddImageGuideBackport") throw new Error(`${count}-keyframe workflow guide chain is invalid`);
-  }
-}
-
-const manifest = JSON.parse(await readFile(join(root, "assets", "workflows", "minimax-h3-default.preset.json"), "utf8"));
-if (manifest.id !== "minimax-h3-default") throw new Error("default workflow preset id mismatch");
-if (Object.keys(manifest.modes.keyframe.variants).length !== 3) throw new Error("default workflow preset is missing keyframe variants");
-
-console.log("dsh-comfy-video-studio package checks passed");
+console.log("dsh-comfy-video-studio dynamic workflow package checks passed");

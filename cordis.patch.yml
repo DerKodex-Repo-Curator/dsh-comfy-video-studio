@@ -3,6 +3,7 @@
       name: dsh-comfy-video-studio
       config:
         baseUrl: http://127.0.0.1:8188
-        maxUploadMb: 40
+        maxUploadMb: 100
+        maxWorkflowMb: 5
         requestTimeoutMs: 30000
         historyLimit: 200
